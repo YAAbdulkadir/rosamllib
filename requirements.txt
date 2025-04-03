@@ -1,0 +1,16 @@
+graphviz
+matplotlib
+numpy
+nibabel
+opencv-python
+pandas
+plotly
+pydicom
+pynetdicom
+rt-utils==1.2.7
+scikit-image
+scipy
+SimpleITK
+SQLAlchemy
+tqdm
+xmltodict
