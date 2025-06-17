@@ -1,5 +1,6 @@
 import os
 import pydicom
+from highdicom.seg import Segmentation, segread
 from pathlib import Path
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
@@ -48,63 +49,37 @@ class SEGReader:
             )
 
     def read(self):
-        """
-        Reads the SEG file or dataset and returns an instance of the SEG class.
 
-        If a file path is provided, it reads the file or searches for a SEG file
-        in the directory. If a dataset is provided, it directly instantiates the SEG class.
-
-        Returns
-        -------
-        SEG
-            An instance of the `SEG` class, initialized with the DICOM SEG dataset.
-
-        Raises
-        ------
-        IOError
-            If no SEG file is found in the directory or if the file cannot be read.
-        """
         if self.seg_file_path:
             if os.path.isdir(self.seg_file_path):
                 seg_file = self._find_seg_in_directory(self.seg_file_path)
                 if not seg_file:
                     raise IOError(f"No SEG file found in directory: {self.seg_file_path}")
-                self.seg_dataset = pydicom.dcmread(seg_file)
+                seg = segread(seg_file)
             else:
-                self.seg_dataset = pydicom.dcmread(self.seg_file_path)
-        elif not self.seg_dataset:
-            raise ValueError("No RTPLAN file path or dataset provided.")
+                seg = segread(self.seg_file_path)
+        elif self.seg_dataset:
+            seg = Segmentation.from_dataset(self.seg_dataset, copy=True)
+        else:
+            raise ValueError("No SEG file path or dataset provided.")
 
-        return SEG(self.seg_dataset)
+        return SEG.from_segmentation(seg, copy=True)
 
-    def _find_seg_in_directory(self, directory_path):
-        """
-        Searches a directory for a SEG file.
+    @staticmethod
+    def _assert_is_seg(ds: Dataset) -> None:
+        if getattr(ds, "Modality", None) != "SEG":
+            raise ValueError("Dataset is not a DICOM Segmentation object.")
 
-        Parameters
-        ----------
-        directory_path : str
-            Path to the directory to search.
-
-        Returns
-        -------
-        str
-            The path to the SEG file if found, otherwise None.
-
-        Raises
-        ------
-        InvalidDicomError
-            If no valid SEG file is found.
-        """
-        for root, _, files in os.walk(directory_path):
-            for file in files:
-                file_path = os.path.join(root, file)
+    @staticmethod
+    def _find_seg_in_directory(folder: Path) -> Path | None:
+        """Return the first SEG file found (depth-first)."""
+        for root, _, files in os.walk(folder):
+            for name in files:
+                fp = Path(root, name)
                 try:
-                    ds = pydicom.dcmread(file_path, stop_before_pixels=True)
-                    if ds.Modality == "SEG":
-                        return file_path
+                    ds = pydicom.dcmread(fp, stop_before_pixels=True)
+                    if getattr(ds, "Modality", None) == "SEG":
+                        return fp
                 except InvalidDicomError:
-                    continue
-                except Exception as e:
-                    print(f"Error reading file {file_path}: {e}")
+                    pass
         return None
