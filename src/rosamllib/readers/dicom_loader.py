@@ -1,5 +1,7 @@
 import os
+import time
 import traceback
+from typing import List, Optional, Union
 import graphviz
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -67,6 +69,7 @@ if in_jupyter:
 
     # Apply theme automatically if running in VS Code Jupyter
     apply_vscode_theme()
+    time.sleep(0.5)
 else:
     from tqdm import tqdm
 
@@ -339,7 +342,7 @@ def process_seg_file(filepath, tags_to_index):
     if hasattr(seg, "ReferencedSeriesSequence"):
         ref_seq = seg.ReferencedSeriesSequence[0]
         if hasattr(ref_seq, "SeriesInstanceUID"):
-            instance_dict["ReferencedSeriesUIDs"] = [ref_seq.SeriesInstanceUID]
+            instance_dict["ReferencedSeriesUIDs"] = ref_seq.SeriesInstanceUID
     instance_dict["ReferencedSOPInstanceUIDs"] = get_referenced_sop_instance_uids(seg)
 
     return instance_dict
@@ -741,7 +744,8 @@ class DICOMLoader:
                             instance.referenced_sids.append(ref_sid)
                             ref_series = series_uid_map.get(ref_sid)
                             if ref_series:
-                                instance.referenced_series.append(ref_series)
+                                if ref_series not in instance.referenced_series:
+                                    instance.referenced_series.append(ref_series)
 
                     elif modality == "REG":
                         # REG references fixed image (referenced_sids) and
@@ -766,7 +770,7 @@ class DICOMLoader:
                         if ref_sids:
                             for ref_sid in ref_sids:
                                 ref_series = series_uid_map.get(ref_sid)
-                                if ref_series:
+                                if ref_series and ref_series not in instance.referenced_series:
                                     instance.referenced_series.append(ref_series)
 
                 # Associate by FrameOfReferenceUID
@@ -1087,7 +1091,16 @@ class DICOMLoader:
         filter_columns = [col for col in filters.keys() if col in filtered_df.columns]
         result_columns = list(set(relevant_columns + filter_columns))
 
-        return filtered_df[result_columns].drop_duplicates().reset_index(drop=True)
+        df_result = filtered_df[result_columns].copy()
+
+        # Convert unhashable types to hashable ones for deduplication
+        for col in df_result.columns:
+            if df_result[col].apply(lambda x: isinstance(x, list)).any():
+                df_result[col] = df_result[col].apply(
+                    lambda x: tuple(x) if isinstance(x, list) else x
+                )
+
+        return df_result.drop_duplicates().reset_index(drop=True)
 
     def process_in_parallel(self, func, level="INSTANCE", num_workers=None):
         """
@@ -1845,54 +1858,169 @@ class DICOMLoader:
         return referencing_items
 
     @staticmethod
-    def get_referenced_items(node, modality=None, level="INSTANCE"):
+    def get_referenced_nodes(
+        node: Union[SeriesNode, InstanceNode],
+        modality: Optional[str] = None,
+        level: str = "INSTANCE",
+        recursive: bool = True,
+    ) -> List[Union[SeriesNode, InstanceNode]]:
         """
-        Retrieves all referenced items (instances or series) for a given node.
+        Retrieves referenced nodes of a specified level and modality from a
+        SeriesNode or InstanceNode.
+
+        This function returns directly referenced nodes by default, and can also traverse
+        the reference graph recursively to find indirectly referenced nodes if `recursive=True`.
 
         Parameters
         ----------
         node : InstanceNode or SeriesNode
-            The starting node for searching referenced items.
+            The node to start from (e.g., RTDOSE instance, CT series).
+
         modality : str, optional
-            Modality to filter the referenced items (e.g., 'CT', 'MR').
-        level : str, {'INSTANCE', 'SERIES'}
-            Level at which to retrieve referenced items.
+            If specified, filters returned nodes by Modality (e.g., "CT", "RTSTRUCT").
+            If None, all modalities are included.
+
+        level : str
+            One of {"INSTANCE", "SERIES"} (case-insensitive).
+            Determines the type of nodes to return:
+            - "INSTANCE": Returns InstanceNode objects
+            - "SERIES": Returns SeriesNode objects
+
+        recursive : bool, optional (default: True)
+            If True, traverses both direct and indirect references recursively.
+            If False, only returns directly referenced nodes.
 
         Returns
         -------
-        list
-            A list of referenced InstanceNode or SeriesNode objects.
+        List[InstanceNode or SeriesNode]
+            A list of referenced nodes matching the given criteria.
+
+        Raises
+        ------
+        ValueError
+            If the level is not one of {"INSTANCE", "SERIES"}.
+
+        Examples
+        --------
+        >>> # Get all CT series (direct + indirect) from an RTDOSE instance
+        >>> get_referenced_nodes(rtdose_instance, modality="CT", level="series")
+
+        >>> # Get only directly referenced RTPLAN instances
+        >>> get_referenced_nodes(
+        >>>     dose_inst,
+        >>>     modality="RTPLAN",
+        >>>     level="instance",
+        >>>     recursive=False
+        >>> )
         """
+        level = level.upper()
         if level not in {"INSTANCE", "SERIES"}:
-            raise ValueError("level must be either 'INSTANCE' or 'SERIES'")
+            raise ValueError("level must be 'INSTANCE' or 'SERIES'")
 
-        referenced_items = []
-        if isinstance(node, InstanceNode):
-            # Get directly referenced instances or series
-            if level == "INSTANCE":
-                referenced_items = node.referenced_instances
-            else:  # level == "SERIES"
-                referenced_items = node.referenced_series
+        visited = set()
+        results = []
 
-        elif isinstance(node, SeriesNode):
-            # Get referenced series
-            if level == "INSTANCE":
-                referenced_items = []
-                for series in node.referenced_series:
-                    referenced_items.extend(series.instances.values())
-            else:  # level == "SERIES"
-                referenced_items = node.referenced_series
+        def traverse(n):
+            if id(n) in visited:
+                return
+            visited.add(id(n))
 
-        else:
-            raise TypeError("Expected an InstanceNode or SeriesNode.")
+            # Yield the node if it's of the right level and matches modality
+            if level == "INSTANCE" and isinstance(n, InstanceNode):
+                if modality is None or getattr(n, "Modality", None) == modality:
+                    results.append(n)
 
-        # Filter by modality if specified
-        if modality:
-            referenced_items = [
-                item for item in referenced_items if getattr(item, "Modality", None) == modality
-            ]
+            elif level == "SERIES" and isinstance(n, SeriesNode):
+                if modality is None or getattr(n, "Modality", None) == modality:
+                    results.append(n)
 
-        return referenced_items
+            # Traverse deeper if recursive is enabled
+            if recursive:
+                # Always follow both instance and series links regardless of output level
+                if isinstance(n, SeriesNode):
+                    for instance in n.instances.values():
+                        for ref in instance.referenced_instances:
+                            traverse(ref)
+                        for ref_series in instance.referenced_series:
+                            traverse(ref_series)
+                elif isinstance(n, InstanceNode):
+                    for ref in n.referenced_instances:
+                        traverse(ref)
+                    for ref_series in n.referenced_series:
+                        traverse(ref_series)
+
+        traverse(node)
+        return results
+
+    @staticmethod
+    def get_nodes_for_patient(
+        patient_node,
+        level="SERIES",
+        modality=None,
+        uid=None,
+    ):
+        """
+        Retrieves StudyNode, SeriesNode, or InstanceNode objects from a given PatientNode.
+
+        Parameters
+        ----------
+        patient_node : PatientNode
+            The patient node to search under.
+
+        level : str, optional
+            One of {"STUDY", "SERIES", "INSTANCE"} (case-insensitive).
+            Determines which level of nodes to return. Default is "SERIES".
+
+        modality : str, optional
+            If specified, filters nodes by Modality (only applicable for SERIES/INSTANCE levels).
+
+        uid : str, optional
+            If specified, filters for a specific UID:
+            - For level="STUDY": matches StudyInstanceUID
+            - For level="SERIES": matches SeriesInstanceUID
+            - For level="INSTANCE": matches SOPInstanceUID
+
+        Returns
+        -------
+        List[StudyNode | SeriesNode | InstanceNode]
+            A list of matching nodes at the requested level.
+            If `uid` is specified, returns at most one element.
+
+        Raises
+        ------
+        ValueError
+            If `level` is not one of {"STUDY", "SERIES", "INSTANCE"}.
+        """
+        level = level.upper()
+        if level not in {"STUDY", "SERIES", "INSTANCE"}:
+            raise ValueError("level must be 'STUDY', 'SERIES', or 'INSTANCE'")
+
+        results = []
+
+        for study_node in patient_node:
+            if level == "STUDY":
+                if uid and study_node.StudyInstanceUID != uid:
+                    continue
+                results.append(study_node)
+
+            elif level == "SERIES":
+                for series_node in study_node:
+                    if uid and series_node.SeriesInstanceUID != uid:
+                        continue
+                    if modality and series_node.Modality != modality:
+                        continue
+                    results.append(series_node)
+
+            elif level == "INSTANCE":
+                for series_node in study_node:
+                    for instance_node in series_node:
+                        if uid and instance_node.SOPInstanceUID != uid:
+                            continue
+                        if modality and instance_node.Modality != modality:
+                            continue
+                        results.append(instance_node)
+
+        return results
 
     def visualize_series_references(
         self,
