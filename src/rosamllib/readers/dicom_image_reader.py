@@ -1,10 +1,11 @@
 import os
 import tempfile
+from typing import List
 import SimpleITK as sitk
-import numpy as np
 from pathlib import Path
 from pydicom import dcmread
 from pydicom.dataset import Dataset
+from pydicom.tag import Tag
 from collections import defaultdict
 from rosamllib.dicoms import DICOMImage
 from rosamllib.utils import sort_by_image_position_patient
@@ -95,18 +96,13 @@ class DICOMImageReader:
         # Sort the file names or datasets based on ImagePositionPatient along the imaging axis
         series_file_names_sorted = sort_by_image_position_patient(series_file_names)
 
+        # Temporary fix for issue https://github.com/SimpleITK/SimpleITK/issues/2214
+        series_file_names_sorted = self._sanitize_spacing(series_file_names_sorted)
+
         # Set filenames manually for SimpleITK reader
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(series_file_names_sorted)
         image = reader.Execute()
-        # image_orientation_patient = dcmread(
-        #     series_file_names[0], stop_before_pixels=True
-        # ).ImageOrientationPatient
-        # row_cosines = np.array(image_orientation_patient[:3]).astype(float)
-        # col_cosines = np.array(image_orientation_patient[3:]).astype(float)
-        # imaging_axis = np.cross(row_cosines, col_cosines)
-        # direction = (*row_cosines[:], *col_cosines[:], *imaging_axis[:])
-        # image.SetDirection(direction)
 
         # Set the common dicom tags by reading the first file
         single_slice = sitk.ReadImage(series_file_names_sorted[0])
@@ -247,3 +243,28 @@ class DICOMImageReader:
             os.remove(temp_file)
 
         return DICOMImage(image)
+
+    @staticmethod
+    def _sanitize_spacing(files: List[str]) -> List[str]:
+        """
+        Return a list of filenames safe for SimpleITK:
+        if first slice has negative SpacingBetweenSlices and is not NM,
+        write a temp copy without that tag and return the temp filenames.
+        """
+        first_hdr = dcmread(files[0], stop_before_pixels=True)
+        if (
+            first_hdr.get("Modality", "") != "NM"
+            and "SpacingBetweenSlices" in first_hdr
+            and float(first_hdr.SpacingBetweenSlices) < 0
+        ):
+            tmp_dir = tempfile.mkdtemp()
+            clean_files = []
+            for f in files:
+                ds = dcmread(f)
+                if "SpacingBetweenSlices" in ds:
+                    del ds[Tag(0x0018, 0x0088)]
+                out = Path(tmp_dir) / Path(f).name
+                ds.save_as(out)
+                clean_files.append(str(out))
+            return clean_files
+        return files
