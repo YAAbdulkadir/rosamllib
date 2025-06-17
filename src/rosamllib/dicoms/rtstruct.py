@@ -264,19 +264,28 @@ class RTStruct(rt_utils.RTStruct):
         """
         return self.get_structure_names().index(structure_name)
 
-    def get_structure_mask(self, structure_name):
+    def get_structure_mask(
+        self, structure_name: str, *, copy_metadata: bool = True, cache: bool = False
+    ) -> sitk.Image:
         """
         Generates and returns a binary mask for a specific structure.
 
         Parameters
         ----------
         structure_name : str
-            The name of the structure to generate the mask for.
+            Name of the structure to generate the mask for.
+        copy_metadata : bool, default True
+            When True, simple DICOM attributes from ``self.ds`` are copied
+            onto the returned mask via ``SetMetaData``.
+        cache : bool, default False
+            When True, the mask is cached in ``self.structure_masks`` and
+            reused on subsequent calls. With False every call rebuilds the
+            mask from the contours.
 
         Returns
         -------
-        numpy.ndarray
-            A 3D numpy array representing the binary mask of the structure.
+        SimpleITK.Image
+            A 3-D mask in the geometry of the referenced image.
 
         Raises
         ------
@@ -288,7 +297,8 @@ class RTStruct(rt_utils.RTStruct):
         Examples
         --------
         >>> mask = rtstruct.get_structure_mask("PTV")
-        >>> mask.shape
+        >>> mask_array = sitk.GetArrayFromImage(mask)
+        >>> mask_array.shape
         (512, 512, 100)
         """
 
@@ -315,10 +325,24 @@ class RTStruct(rt_utils.RTStruct):
                 UserWarning,
             )
         mask = sitk.GetImageFromArray(mask)
-        mask.SetDirection(self.referenced_image.GetDirection())
-        mask.SetOrigin(self.referenced_image.GetOrigin())
-        mask.SetSpacing(self.referenced_image.GetSpacing())
-        self.structure_masks[structure_name] = mask  # Cache the generated mask
+        mask.CopyInformation(self.referenced_image)
+
+        if copy_metadata and getattr(self, "ds", None) is not None:
+            # Skip binary blobs and sequences - they either break SetMetaData
+            # or bloat the image header
+            _skip_vr = {"OB", "OW", "OF", "UN", "SQ"}
+            for elem in self.ds.iterall():
+                if elem.VR in _skip_vr:
+                    continue
+                tag_key = f"{elem.tag.group:04x}|{elem.tag.element:04x}"
+                try:
+                    mask.SetMetaData(tag_key, str(elem.value))
+                except Exception:
+                    # Ignore tags that SimpleITK rejects (e.g. very long strings)
+                    pass
+
+        if cache:
+            self.structure_masks[structure_name] = mask
 
         return mask
 
@@ -366,10 +390,6 @@ class RTStruct(rt_utils.RTStruct):
             )
 
             # Ensure all points are on a single slice
-            # TODO
-            # handle cases where points do not lie on a single slices becuase
-            # sitk might have re-oriented to one of the standard orientations
-            # and therefore, slice_index might not be unique
             slice_index = np.unique(indices[:, 2])
             if len(slice_index) != 1:
                 raise ValueError("Contour points do not lie on a single slice")
