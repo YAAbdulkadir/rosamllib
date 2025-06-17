@@ -107,37 +107,12 @@ class ImageRegistration:
         if transform_matrix is None or transform_matrix.shape != (4, 4):
             raise ValueError("Valid 4x4 rigid transformation matrix not found in REG data.")
 
-        # Get Frame of Reference UIDs
-        fixed_for_uid = (
-            self.fixed_image.GetMetaData("0020|0052")
-            if hasattr(self.fixed_image, "GetMetaData")
-            and self.fixed_image.HasMetaDataKey("0020|0052")
-            else None
-        )
-        moving_for_uid = (
-            self.moving_mage.GetMetaData("0020|0052")
-            if hasattr(self.moving_image, "GetMetaData")
-            and self.moving_image.HasMetaDataKey("0020|0052")
-            else None
-        )
+        # TODO
+        # The plan is to check if the reg reader correctly assigned the fixed image info
+        # and the moving image info. If not, swap the info.
+        # But do we want this behavior?
 
-        # Get REG Frame of Reference UIDs
-        reg_fixed_uid = self.reg.get_fixed_image_info().get("SourceFrameOfReferenceUID", None)
-        reg_moving_uid = self.reg.get_moving_image_info().get("SourceFrameOfReferenceUID", None)
-
-        invert_needed = False
-
-        if reg_moving_uid == moving_for_uid and reg_fixed_uid == fixed_for_uid:
-            invert_needed = False
-        elif reg_moving_uid == fixed_for_uid and reg_fixed_uid == moving_for_uid:
-            invert_needed = True
-        else:
-            # If we can't determine set the default to True
-            invert_needed = True
-
-        if invert_needed:
-            transform_matrix = np.linalg.inv(transform_matrix)
-            pass
+        transform_matrix = np.linalg.inv(transform_matrix)
 
         # Create an AffineTransform in SimpleITK
         affine_transform = sitk.AffineTransform(3)
