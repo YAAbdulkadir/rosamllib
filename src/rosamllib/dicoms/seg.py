@@ -1,104 +1,153 @@
-import pydicom
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Dict, Union
+
+import numpy as np
+import SimpleITK as sitk
+from highdicom.seg import Segmentation, segread
 from pydicom.dataset import Dataset
 
 
-class SEG:
-    def __init__(self, seg_dataset: Dataset):
-        """
-        Initialize the SEG object with a DICOM SEG dataset.
+class SEG(Segmentation):
+    """Light-weight wrapper that streamlines common SEG tasks."""
+
+    @classmethod
+    def from_segmentation(cls, seg: Segmentation, *, copy: bool = False) -> "SEG":
+        """Wrap an *existing* Segmentation in the SEG subclass.
 
         Parameters
         ----------
-        seg_dataset : pydicom.Dataset
-            The DICOM SEG dataset representing the .
+        seg   : highdicom.seg.Segmentation
+            The object you got back from `segread()` or similar.
+        copy  : bool, default False
+            If ``True`` deep-copies the underlying pydicom Dataset
+            first; otherwise the original object is mutated in place.
         """
-        self.seg_dataset = seg_dataset
+        return cls.from_dataset(seg, copy=copy)
 
-    def __getattr__(self, attr):
+    @classmethod
+    def from_file(cls, fp: Union[str, Path]) -> "SEG":
+        """Load from disk and up-cast in one line."""
+        return cls.from_segmentation(segread(fp), copy=False)
+
+    @classmethod
+    def from_dataset_obj(cls, ds: Dataset, *, copy: bool = False) -> "SEG":
+        """Up-cast a raw `Dataset` that you already have in memory."""
+        return cls.from_dataset(ds, copy=copy)
+
+    def get_segment_labels(self, *, as_dict: bool = False) -> Union[List[str], Dict[int, str]]:
+        """Return the DICOM *Segment Label* for every segment."""
+        descriptions = self.SegmentSequence
+        if as_dict:
+            return {d.segment_number: d.segment_label for d in descriptions}
+        return [d.segment_label for d in descriptions]
+
+    def get_segment_mask(
+        self,
+        segment_number: int,
+        *,
+        ignore_spatial_locations: bool = True,
+    ) -> sitk.Image:
         """
-        Allows attribute access for DICOM metadata via dot notation.
+        Return one segment as a `SimpleITK.Image`.
 
         Parameters
         ----------
-        attr : str
-            The attribute being accessed (e.g., 'PatientID').
+        segment_number : int
+            DICOM *Segment Number* (not zero-based index!).
+        ignore_spatial_locations : bool, default True
+            Only relevant if the fast `get_volume()` path fails and we
+            have to fall back to frame-based extraction.  Passed through
+            to `get_pixels_by_source_instance()`.
 
         Returns
         -------
-        str
-            The value of the requested DICOM metadata tag.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute is not a valid DICOM keyword or metadata is not found.
+        SimpleITK.Image
+            Binary mask aligned to the source image geometry.
         """
-        if attr in self.dir():
-            return getattr(self.seg_dataset, attr)
+        # ---------------- fast path: regular 3‑D volume --------------
+        vol = self.get_volume(
+            segment_numbers=[segment_number],
+            combine_segments=False,  # 4‑D: z,y,x,segments
+            allow_missing_positions=False,  # require complete grid
+        )
+        if vol is not None:
+            # Only one segment, so vol.array shape → (z, y, x, 1)
+            mask_arr = np.squeeze(vol.array, axis=3)  # -> (z, y, x)
 
-        # Fallback to the parent class method if not a valid DICOM attribute
-        try:
-            return super().__getattr__(attr)
-        except Exception:
-            raise AttributeError(f"'SEG' object has no attribute '{attr}'")
+            img = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
 
-    def __setattr__(self, attr, value):
+            # volume spacing is (Δz, Δy, Δx); ITK expects (Δx, Δy, Δz)
+            dz, dy, dx = vol.spacing
+            img.SetSpacing((dx, dy, dz))
+            img.SetOrigin(vol.position)
+            dir_itk = np.column_stack(
+                [
+                    vol.direction[:, 2],  # X ← original column axis
+                    vol.direction[:, 1],  # Y ← original row axis
+                    vol.direction[:, 0],  # Z ← original slice axis
+                ]
+            ).ravel(order="C")
+            img.SetDirection(tuple(dir_itk))
+            return img
+
+        # --------------- fallback: irregular / tiled SEG -------------
+        src_uids = [u for _, _, u in self.get_source_image_uids()]
+        mask4d = self.get_pixels_by_source_instance(
+            source_sop_instance_uids=src_uids,
+            segment_numbers=[segment_number],
+            combine_segments=False,
+            skip_overlap_checks=True,
+            ignore_spatial_locations=ignore_spatial_locations,
+        )
+        mask_arr = np.squeeze(mask4d, axis=3).astype(np.uint8)
+
+        img = sitk.GetImageFromArray(mask_arr)
+
+        # Geometry: copy from first source slice (approximation)
+        first_ds = self._source_images[0]
+        dz = abs(float(first_ds.SliceThickness))
+        dy, dx = map(float, first_ds.PixelSpacing)
+        img.SetSpacing((dx, dy, dz))
+        img.SetOrigin(tuple(map(float, first_ds.ImagePositionPatient)))
+        orient = tuple(map(float, first_ds.ImageOrientationPatient))
+        dir_itk = orient[:3] + orient[3:] + (0.0,)
+        img.SetDirection(dir_itk)
+        return img
+
+    @staticmethod
+    def resample_to_reference(
+        moving: sitk.Image,
+        reference: sitk.Image,
+        *,
+        is_label: bool = True,
+        default_value: int | float = 0,
+    ) -> sitk.Image:
         """
-        Allows setting DICOM metadata attributes via dot notation.
+        Resample `moving` onto the grid of `reference` (size, spacing,
+        origin, direction).
 
         Parameters
         ----------
-        attr : str
-            The attribute being set (e.g., 'PatientID').
-        value : str
-            The value to be assigned to the attribute.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute is not a valid DICOM keyword or if setting fails.
-        """
-        if attr == "seg_dataset":
-            super().__setattr__(attr, value)
-            return
-
-        try:
-            # Try to find the corresponding DICOM tag for the keyword
-            tag = pydicom.datadict.tag_for_keyword(attr)
-            if tag is not None:
-                tag_obj = pydicom.tag.Tag(tag)
-                tag_str = f"{tag_obj.group:04X}|{tag_obj.element:04X}"
-                self.seg_dataset[tag_str].value = value
-            else:
-                # If it's not a valid DICOM tag, set it as a regular attribute
-                super().__setattr__(attr, value)
-        except Exception:
-            # If anything goes wrong, fall back to setting the attribute normally
-            super().__setattr__(attr, value)
-
-    def __dir__(self):
-        """
-        Returns a list of attributes and DICOM metadata keywords.
+        moving : SimpleITK.Image
+            Mask or probability map you want to overlay.
+        reference : SimpleITK.Image
+            The MR / CT (or any image) that defines the desired grid.
+        is_label : bool, default True
+            • True   → use *nearest-neighbour* (keeps binary/label integrity).
+            • False  → use *linear* (for probability / fractional masks).
+        default_value : int|float, default 0
+            Value for voxels outside the `moving` field of view.
 
         Returns
         -------
-        list
-            A combined list of attributes and DICOM metadata keywords.
+        SimpleITK.Image
+            `moving`, resampled so that
+            `resampled.GetSize() == reference.GetSize()`, etc.
         """
-        default_dir = super().__dir__()
-        dicom_keywords = [pydicom.datadict.keyword_for_tag(tag) for tag in self.seg_dataset.keys()]
-        dicom_keywords = [keyword for keyword in dicom_keywords if keyword]  # Filter out None
-
-        # Combine the default attributes with the DICOM keywords
-        return default_dir + dicom_keywords
-
-    def dir(self):
-        """
-        Custom dir method to return a list of available attributes and DICOM metadata keywords.
-
-        Returns
-        -------
-        list of str
-            List of all attributes, including DICOM metadata keywords.
-        """
-        return self.__dir__()
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(reference)
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(default_value)
+        resampler.SetTransform(sitk.Transform())  # identity
+        return resampler.Execute(moving)
