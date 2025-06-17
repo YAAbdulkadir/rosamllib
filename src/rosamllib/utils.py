@@ -15,7 +15,7 @@ from rosamllib.constants import VR_TO_DTYPE
 from ipaddress import ip_address
 
 
-def sort_by_image_position_patient(file_names_or_datasets):
+def sort_by_image_position_patient(file_names_or_datasets, reverse=False):
     """
     Sorts DICOM image files or datasets based on their position along the imaging axis.
 
@@ -59,7 +59,9 @@ def sort_by_image_position_patient(file_names_or_datasets):
             print(f"Could not read dataset: {e}")
             return float("inf")
 
-    sorted_items = sorted(file_names_or_datasets, key=get_image_position_along_imaging_axis)
+    sorted_items = sorted(
+        file_names_or_datasets, key=get_image_position_along_imaging_axis, reverse=reverse
+    )
     return sorted_items
 
 
