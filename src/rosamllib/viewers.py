@@ -1,4 +1,6 @@
+import os
 import copy
+import time
 import numpy as np
 import SimpleITK as sitk
 import matplotlib.pyplot as plt
@@ -66,6 +68,31 @@ def jupyter_environment():
     except Exception:
         # If anything unexpected happened, assume not in Jupyter
         return "Not in Jupyter"
+
+
+def apply_vscode_theme():
+    """Automatically detect VS Code and apply styling."""
+    if "VSCODE_PID" in os.environ:
+        style = """
+        <style>
+            .cell-output-ipywidget-background {
+                background-color: transparent !important;
+            }
+            :root {
+                --jp-widgets-color: var(--vscode-editor-foreground);
+                --jp-widgets-font-size: var(--vscode-editor-font-size);
+            } 
+        </style>
+        """
+        display(HTML(style))
+
+
+if in_jupyter:
+    from IPython.display import display, HTML
+
+    # Apply theme automatically if running in VS Code Jupyter
+    apply_vscode_theme()
+    time.sleep(0.5)
 
 
 def apply_window_level(image, window=None, level=None):
