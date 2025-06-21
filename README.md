@@ -34,9 +34,11 @@ pip install .
 
 ## Documentation
 Detailed documentation is available in the form of Jupyter notebooks within the repository. These provide step-by-step examples and usage guides for the core functionality of **rosamllib**:
-- [Reading DICOM Images](https://gitlab.com/YAAF/rosamllib/-/blob/main/examples/reading_dicom_images.ipynb)
-- [Reading RTSTRUCT Files](https://gitlab.com/YAAF/rosamllib/-/blob/main/examples/reading_dicom_rtstruct.ipynb)
-- [Reading RTDOSE Files](https://gitlab.com/YAAF/rosamllib/-/blob/main/examples/reading_dicom_rtdose.ipynb)
+- [Rosamllib Basic Tutorial](https://github.com/YAAbdulkadir/rosamllib/blob/main/examples/rosamllib_tutorial.ipynb)
+- [Reading DICOM Images](https://github.com/YAAbdulkadir/rosamllib/blob/main/examples/reading_dicom_images.ipynb)
+- [Reading RTSTRUCT Files](https://github.com/YAAbdulkadir/rosamllib/blob/main/examples/reading_dicom_rtstruct.ipynb)
+- [Reading RTDOSE Files](https://github.com/YAAbdulkadir/rosamllib/blob/main/examples/reading_dicom_rtdose.ipynb)
+- [Working with Registrations](https://github.com/YAAbdulkadir/rosamllib/blob/main/examples/registrations.ipynb)
 
 ## Contributing
 We welcome contributions to improve rosamllib! If you encounter bugs or have feature requests, feel free to open an issue or submit a pull request.If you would like to contribute:
