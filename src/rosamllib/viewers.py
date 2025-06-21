@@ -484,12 +484,15 @@ def interactive_image_viewer(
         if axis == 0:
             new_spacing[0] = 1.0
             new_spacing[1] = 1.0
+            new_spacing[2] = current_spacing[2]
         elif axis == 1:
             new_spacing[0] = 1.0
             new_spacing[2] = 1.0
+            new_spacing[1] = current_spacing[1]
         elif axis == 2:
             new_spacing[1] = 1.0
             new_spacing[2] = 1.0
+            new_spacing[0] = current_spacing[0]
 
         original_size = img.GetSize()
         new_size = [
