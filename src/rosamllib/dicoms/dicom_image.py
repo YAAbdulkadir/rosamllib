@@ -2,6 +2,8 @@ import pydicom
 import numpy as np
 import SimpleITK as sitk
 import matplotlib.pyplot as plt
+from rosamllib.utils import transform_image
+from pydicom.uid import generate_uid
 
 
 class DICOMImage(sitk.Image):
@@ -234,6 +236,55 @@ class DICOMImage(sitk.Image):
         resample.SetInterpolator(sitk.sitkLinear)
 
         return DICOMImage(resample.Execute(self))
+
+    def transform_image(
+        self,
+        angle_degrees: float = 0.0,
+        axis: np.ndarray = np.array([0, 0, 1]),
+        translation: np.ndarray = np.array([0.0, 0.0, 0.0]),
+        interpolator=sitk.sitkLinear,
+        default_value=None,
+    ) -> sitk.Image:
+        """
+        Applies a rigid transformation (rotation about arbitrary axis + translation)
+        to a 3D SimpleITK image.
+
+        Parameters
+        ----------
+        angle_degrees : float
+            Rotation angle in degrees. Default is 0 (no rotation).
+        axis : np.ndarray
+            Axis of rotation as a 3-element array. Will be normalized.
+        translation : np.ndarray
+            Translation vector [dx, dy, dz] in mm.
+        interpolator : sitk.InterpolatorEnum
+            Interpolation method (e.g., sitk.sitkLinear or sitk.sitkNearestNeighbor).
+        default_value : float
+            Default value for pixels outside the image domain.
+
+        Returns
+        -------
+        sitk.Image
+            The transformed image.
+        """
+        transformed_image = transform_image(
+            self, angle_degrees, axis, translation, interpolator, default_value
+        )
+        transformed_image = DICOMImage(transformed_image)
+
+        original_metadata_dict = {key: self.GetMetaData(key) for key in self.GetMetaDataKeys()}
+
+        for k, v in original_metadata_dict.items():
+            transformed_image.SetMetaData(k, v)
+
+        transformed_image.SetMetaData(
+            "0008|0018",
+        )
+
+        transformed_image.SetMetaData("0020|000e", generate_uid())  # SeriesInstanceUID
+
+        # TODO
+        # make sure all tags are correctly updated
 
     def visualize(
         self,
