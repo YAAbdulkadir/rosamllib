@@ -695,3 +695,69 @@ def get_running_env():
             return "jupyter_notebook"
     except Exception:
         return "script"  # Fallback to script mode
+
+
+def transform_image(
+    image: sitk.Image,
+    angle_degrees: float = 0.0,
+    axis: np.ndarray = np.array([0, 0, 1]),
+    translation: np.ndarray = np.array([0.0, 0.0, 0.0]),
+    interpolator=sitk.sitkLinear,
+    default_value=None,
+) -> sitk.Image:
+    """
+    Applies a rigid transformation (rotation about arbitrary axis + translation)
+    to a 3D SimpleITK image.
+
+    Parameters
+    ----------
+    image : sitk.Image
+        The input 3D image.
+    angle_degrees : float
+        Rotation angle in degrees. Default is 0 (no rotation).
+    axis : np.ndarray
+        Axis of rotation as a 3-element array. Will be normalized.
+    translation : np.ndarray
+        Translation vector [dx, dy, dz] in mm.
+    interpolator : sitk.InterpolatorEnum
+        Interpolation method (e.g., sitk.sitkLinear or sitk.sitkNearestNeighbor).
+    default_value : float
+        Default value for pixels outside the image domain.
+
+    Returns
+    -------
+    sitk.Image
+        The transformed image.
+    """
+
+    # Normalize the axis
+    axis = axis / np.linalg.norm(axis)
+
+    # Convert angle to radians
+    angle_rad = np.deg2rad(angle_degrees)
+    half_angle = angle_rad / 2.0
+
+    # Compute versor (vector part of quaternion)
+    versor = np.sin(half_angle) * axis
+
+    # Get image center in physical coordinates
+    size = image.GetSize()
+    spacing = image.GetSpacing()
+    origin = image.GetOrigin()
+
+    center = [origin[i] + 0.5 * spacing[i] * size[i] for i in range(3)]
+
+    # Create the transform
+    transform = sitk.VersorRigid3DTransform()
+    transform.SetCenter(center)
+    transform.SetRotation(versor, angle_rad)
+    transform.SetTranslation(translation.tolist())
+
+    # Get default value
+    if default_value is None:
+        default_value = np.min(sitk.GetArrayViewFromImage(image)).astype(float)
+
+    # Resample
+    transformed_image = sitk.Resample(image, image, transform, interpolator, default_value)
+
+    return transformed_image
