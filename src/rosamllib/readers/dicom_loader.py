@@ -63,7 +63,7 @@ def apply_vscode_theme():
         display(HTML(style))
 
 
-if in_jupyter:
+if in_jupyter():
     from tqdm.notebook import tqdm
     from IPython.display import display, HTML
 
