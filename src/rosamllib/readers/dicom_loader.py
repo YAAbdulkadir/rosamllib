@@ -57,7 +57,7 @@ def apply_vscode_theme():
             :root {
                 --jp-widgets-color: var(--vscode-editor-foreground);
                 --jp-widgets-font-size: var(--vscode-editor-font-size);
-            } 
+            }
         </style>
         """
         display(HTML(style))

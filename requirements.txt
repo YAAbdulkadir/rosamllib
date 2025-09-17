@@ -1,4 +1,5 @@
 graphviz
+highdicom
 matplotlib
 numpy
 nibabel
