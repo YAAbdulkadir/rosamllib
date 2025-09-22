@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="240" viewBox="0 0 960 240" role="img" aria-label="RosamlLib wordmark with dose-ring o">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="240" viewBox="0 0 960 240" role="img" aria-label="Rosaml-Lib wordmark with dose-ring o">
   <defs>
     <style>
       .txt {
@@ -23,6 +23,6 @@
   <circle class="ring" cx="168" cy="120" r="14" opacity="0.6"/>
   <circle class="dot"  cx="168" cy="120" r="4"/>
 
-  <!-- Rest: samlLib (capital second L) -->
-  <text class="txt" x="220" y="160">samlLib</text>
+  <!-- Rest: saml-Lib (capital second L, with hyphen) -->
+  <text class="txt" x="220" y="160">saml-Lib</text>
 </svg>
