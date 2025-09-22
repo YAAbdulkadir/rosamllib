@@ -1,4 +1,4 @@
-# **rosamllib**
+![Rosaml-Lib](https://raw.githubusercontent.com/YAAbdulkadir/rosamllib/main/brand/logo-wordmark.svg)
 
 **rosamllib** is a Python package for reading, manipulating, and visualizing DICOM files, particularly focusing on radiotherapy-related DICOM formats like RTSTRUCT and RTDOSE. The library simplifies the process of extracting useful information from DICOM files, overlaying contours on medical images, and resampling dose grids for dose distribution visualization.
 
