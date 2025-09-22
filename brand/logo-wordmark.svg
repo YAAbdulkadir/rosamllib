@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="240" viewBox="0 0 960 240" role="img" aria-label="RosamlLib wordmark with dose-ring o">
+  <defs>
+    <style>
+      .txt {
+        font-family: 'Inter', 'IBM Plex Sans', 'Source Sans 3', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+        font-weight: 700;
+        font-size: 140px;
+        fill: #0F766E;
+        letter-spacing: 0.02em;
+      }
+      .ring { fill: none; stroke: #0F766E; stroke-width: 10; }
+      .dot  { fill: #0F766E; }
+    </style>
+  </defs>
+
+  <!-- Capital R -->
+  <text class="txt" x="40" y="160">R</text>
+
+  <!-- Dose-ring “o” -->
+  <circle class="ring" cx="168" cy="120" r="38"/>
+  <circle class="ring" cx="168" cy="120" r="26" opacity="0.8"/>
+  <circle class="ring" cx="168" cy="120" r="14" opacity="0.6"/>
+  <circle class="dot"  cx="168" cy="120" r="4"/>
+
+  <!-- Rest: samlLib (capital second L) -->
+  <text class="txt" x="220" y="160">samlLib</text>
+</svg>
