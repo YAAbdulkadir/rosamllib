@@ -1,3 +1,17 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, Optional, Any
+import re
+
+_UID_RE = re.compile(r"^\d+(?:\.\d+)*$")
+
+
+def _is_uid(s: str) -> bool:
+    return isinstance(s, str) and bool(_UID_RE.match(s))
+
+
+@dataclass(slots=True)
 class DatasetNode:
     """
     Represents a dataset or collection of patients in the DICOM hierarchy.
@@ -46,90 +60,98 @@ class DatasetNode:
     '12345', 'John Doe'
     """
 
-    def __init__(self, dataset_id, dataset_name=None):
-        self.dataset_id = dataset_id
-        self.dataset_name = dataset_name
-        self.patients = {}  # Key: PatientID
+    dataset_id: str
+    dataset_name: Optional[str] = None
+    patients: Dict[str, PatientNode] = field(default_factory=dict)
 
-    def add_patient(self, patient_node):
-        """
-        Adds a PatientNode to the dataset.
+    def accept(self, visitor):
+        return visitor.visit_dataset(self)
 
-        Parameters
-        ----------
-        patient_node : PatientNode
-            The `PatientNode` to add to this dataset.
+    # --- mutation ---
+    def add_patient(self, patient_node: PatientNode, *, overwrite: bool = False) -> None:
+        pid = patient_node.PatientID
+        if not pid:
+            raise ValueError("PatientNode must have a non-empty PatientID")
+        if (pid in self.patients) and not overwrite:
+            raise KeyError(f"Patient '{pid}' already exists (set overwrite=True to replace).")
+        self.patients[pid] = patient_node
+        patient_node.parent_dataset = self
 
-        Examples
-        --------
-        >>> dataset.add_patient(patient_node)
-        """
-        self.patients[patient_node.PatientID] = patient_node
+    def get_or_create_patient(
+        self, patient_id: str, patient_name: Optional[str] = None
+    ) -> PatientNode:
+        p = self.patients.get(patient_id)
+        if p is None:
+            p = PatientNode(patient_id=patient_id, patient_name=patient_name, parent_dataset=self)
+            self.patients[patient_id] = p
+        return p
 
-    def get_patient(self, patient_id):
-        """
-        Retrieves a PatientNode from the dataset based on the provided PatientID.
-
-        Parameters
-        ----------
-        patient_id : str
-            The unique identifier for the patient (PatientID) to retrieve.
-
-        Returns
-        -------
-        PatientNode or None
-            The `PatientNode` instance associated with the given PatientID if found,
-            otherwise None.
-
-        Examples
-        --------
-        >>> patient = dataset.get_patient("12345")
-        >>> if patient:
-        ...     print(patient.PatientID, patient.PatientName)
-        ... else:
-        ...     print("Patient not found.")
-        """
+    # --- access ---
+    def get_patient(self, patient_id: str) -> Optional[PatientNode]:
         return self.patients.get(patient_id)
 
-    def __len__(self):
-        """
-        Returns the number of patients in the dataset.
+    def __getitem__(self, patient_id: str) -> PatientNode:
+        return self.patients[patient_id]
 
-        Returns
-        -------
-        int
-            The total number of `PatientNode` instances in the dataset.
-        """
+    def __contains__(self, patient_id: str) -> bool:
+        return patient_id in self.patients
+
+    # --- iter / lens / repr ---
+    def __len__(self) -> int:
         return len(self.patients)
 
-    def __iter__(self):
-        """
-        Iterates over all `PatientNode` objects in the dataset.
-
-        Yields
-        ------
-        PatientNode
-            Each patient node in the dataset.
-        """
+    def __iter__(self) -> Iterator[PatientNode]:
         return iter(self.patients.values())
 
-    def __repr__(self):
-        """
-        Returns a string representation of the `DatasetNode`, including the dataset ID,
-        name, and number of patients.
-
-        Returns
-        -------
-        str
-            A string representation of the `DatasetNode` object.
-        """
+    def __repr__(self) -> str:
         return (
-            f"DatasetNode(dataset_id={self.dataset_id}, "
-            f"dataset_name={self.dataset_name}, "
-            f"NumPatients={len(self)})"
+            f"DatasetNode(dataset_id={self.dataset_id!r}, "
+            f"dataset_name={self.dataset_name!r}, NumPatients={len(self)})"
         )
 
+    # --- traversal helpers ---
+    def iter_studies(self) -> Iterator[StudyNode]:
+        for patient in self:
+            yield from patient
 
+    def iter_series(self) -> Iterator[SeriesNode]:
+        for study in self.iter_studies():
+            yield from study
+
+    def iter_instances(self) -> Iterator[InstanceNode]:
+        for series in self.iter_series():
+            yield from series
+
+    # --- finders ---
+    def find_series(self, series_uid: str) -> Optional[SeriesNode]:
+        for s in self.iter_series():
+            if s.SeriesInstanceUID == series_uid:
+                return s
+        return None
+
+    def find_instance(self, sop_uid: str) -> Optional[InstanceNode]:
+        for inst in self.iter_instances():
+            if inst.SOPInstanceUID == sop_uid:
+                return inst
+        return None
+
+    # --- (de)serialization ---
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_id": self.dataset_id,
+            "dataset_name": self.dataset_name,
+            "patients": {pid: p.to_dict() for pid, p in self.patients.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DatasetNode:
+        ds = cls(dataset_id=d["dataset_id"], dataset_name=d.get("dataset_name"))
+        for p in d.get("patients", {}).values():
+            ds.add_patient(PatientNode.from_dict(p, parent_dataset=ds))
+        return ds
+
+
+@dataclass(slots=True)
 class PatientNode:
     """
     Represents a patient in the DICOM hierarchy.
@@ -185,114 +207,95 @@ class PatientNode:
     '1.2.3.4.5'
     """
 
-    def __init__(self, patient_id, patient_name=None, parent_dataset=None):
-        self.PatientID = patient_id
-        self.PatientName = patient_name
-        self.studies = {}  # Key: StudyInstanceUID
-        self.parent_dataset = parent_dataset
+    patient_id: str
+    patient_name: Optional[str] = None
+    parent_dataset: Optional[DatasetNode] = None
+    studies: Dict[str, StudyNode] = field(default_factory=dict)
 
-    def add_study(self, study_node):
-        """
-        Adds a StudyNode to the patient's studies.
+    @property
+    def PatientID(self) -> str:
+        return self.patient_id
 
-        Parameters
-        ----------
-        study_node : StudyNode
-            The `StudyNode` object to add to this patient.
+    @property
+    def PatientName(self) -> Optional[str]:
+        return self.patient_name
 
-        Examples
-        --------
-        >>> study = StudyNode(study_uid="1.2.3.4.5", study_description="CT Chest")
-        >>> patient.add_study(study)
-        """
-        self.studies[study_node.StudyInstanceUID] = study_node
+    def accept(self, visitor):
+        return visitor.visit_patient(self)
+
+    # --- mutation ---
+    def add_study(self, study_node: StudyNode, *, overwrite: bool = False) -> None:
+        uid = study_node.StudyInstanceUID
+        if not _is_uid(uid):
+            raise ValueError(f"Invalid StudyInstanceUID: {uid!r}")
+        if (uid in self.studies) and not overwrite:
+            raise KeyError(f"Study '{uid}' already exists (set overwrite=True to replace).")
+        self.studies[uid] = study_node
         study_node.parent_patient = self
 
-    def get_study(self, study_uid):
-        """
-        Retrieves a StudyNode by its StudyInstanceUID.
+    def get_or_create_study(
+        self, study_uid: str, study_description: Optional[str] = None
+    ) -> StudyNode:
+        s = self.studies.get(study_uid)
+        if s is None:
+            if not _is_uid(study_uid):
+                raise ValueError(f"Invalid StudyInstanceUID: {study_uid!r}")
+            s = StudyNode(
+                study_uid=study_uid, study_description=study_description, parent_patient=self
+            )
+            self.studies[study_uid] = s
+        return s
 
-        Parameters
-        ----------
-        study_uid : str
-            The unique identifier of the study to retrieve.
-
-        Returns
-        -------
-        StudyNode or None
-            The `StudyNode` instance if found, or None if not present.
-
-        Examples
-        --------
-        >>> study = patient.get_study("1.2.3.4.5")
-        >>> print(study.StudyInstanceUID)
-        '1.2.3.4.5'
-        """
+    # --- access / dunder ---
+    def get_study(self, study_uid: str) -> Optional[StudyNode]:
         return self.studies.get(study_uid)
 
-    def __getattr__(self, name):
-        """
-        Delegates attribute access to the parent_dataset if the attribute
-        is not found in the PatientNode itself.
+    def __getitem__(self, study_uid: str) -> StudyNode:
+        return self.studies[study_uid]
 
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to retrieve.
+    def __contains__(self, study_uid: str) -> bool:
+        return study_uid in self.studies
 
-        Returns
-        -------
-        Any
-            The value of the requested attribute if it exists, or raises AttributeError.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute does not exist in either PatientNode or parent_dataset.
-        """
-        if self.parent_dataset is not None:
-            return getattr(self.parent_dataset, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-    def __len__(self):
-        """
-        Returns the number of studies associated with the patient.
-
-        Returns
-        -------
-        int
-            The total number of `StudyNode` instances in the patient's studies.
-        """
+    def __len__(self) -> int:
         return len(self.studies)
 
-    def __iter__(self):
-        """
-        Iterates over all `StudyNode` objects associated with the patient.
-
-        Yields
-        ------
-        StudyNode
-            Each study node associated with the patient.
-        """
+    def __iter__(self) -> Iterator[StudyNode]:
         return iter(self.studies.values())
 
-    def __repr__(self):
-        """
-        Returns a string representation of the `PatientNode`, including the PatientID,
-        PatientName, and the number of studies.
+    def __getattr__(self, name: str) -> Any:
+        if self.parent_dataset is not None:
+            return getattr(self.parent_dataset, name)
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
-        Returns
-        -------
-        str
-            A string representation of the `PatientNode` object.
-        """
+    def __repr__(self) -> str:
         return (
-            f"PatientNode(PatientID={self.PatientID}, "
-            f"PatientName={self.PatientName}, "
-            f"NumStudies={len(self)})"
+            f"PatientNode(PatientID={self.PatientID!r}, "
+            f"PatientName={self.PatientName!r}, NumStudies={len(self)})"
         )
 
+    # --- serialization ---
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "PatientID": self.PatientID,
+            "PatientName": self.PatientName,
+            "studies": {uid: s.to_dict() for uid, s in self.studies.items()},
+        }
 
+    @classmethod
+    def from_dict(
+        cls, d: dict[str, Any], parent_dataset: Optional[DatasetNode] = None
+    ) -> PatientNode:
+        p = cls(
+            patient_id=d["PatientID"],
+            patient_name=d.get("PatientName"),
+            parent_dataset=parent_dataset,
+        )
+        for s in d.get("studies", {}).values():
+            p.add_study(StudyNode.from_dict(s, parent_patient=p))
+        return p
+
+
+@dataclass(slots=True)
 class StudyNode:
     """
     Represents a study in the DICOM hierarchy.
@@ -352,118 +355,95 @@ class StudyNode:
     '1.2.840.113619.2.55.4'
     """
 
-    def __init__(self, study_uid, study_description=None, parent_patient=None):
-        """
-        Initialize a StudyNode with the given study instance UID, optional study description,
-        and optional parent patient.
-        """
-        self.StudyInstanceUID = study_uid
-        self.StudyDescription = study_description
-        self.series = {}  # Key: SeriesInstanceUID
-        self.parent_patient = parent_patient
+    study_uid: str
+    study_description: Optional[str] = None
+    parent_patient: Optional[PatientNode] = None
+    series: Dict[str, SeriesNode] = field(default_factory=dict)
 
-    def add_series(self, series_node):
-        """
-        Adds a SeriesNode to the study's series.
+    @property
+    def StudyInstanceUID(self) -> str:
+        return self.study_uid
 
-        Parameters
-        ----------
-        series_node : SeriesNode
-            The `SeriesNode` object to add to this study.
+    @property
+    def StudyDescription(self) -> Optional[str]:
+        return self.study_description
 
-        Examples
-        --------
-        >>> series = SeriesNode(series_uid="1.2.840.113619.2.55.4")
-        >>> study.add_series(series)
-        """
-        self.series[series_node.SeriesInstanceUID] = series_node
+    def accept(self, visitor):
+        return visitor.visit_study(self)
+
+    # --- mutation ---
+    def add_series(self, series_node: SeriesNode, *, overwrite: bool = False) -> None:
+        uid = series_node.SeriesInstanceUID
+        if not _is_uid(uid):
+            raise ValueError(f"Invalid SeriesInstanceUID: {uid!r}")
+        if (uid in self.series) and not overwrite:
+            raise KeyError(f"Series '{uid}' already exists (set overwrite=True to replace).")
+        self.series[uid] = series_node
         series_node.parent_study = self
 
-    def get_series(self, series_uid):
-        """
-        Retrieves a SeriesNode by its SeriesInstanceUID.
+    def get_or_create_series(
+        self, series_uid: str, modality: Optional[str] = None, desc: Optional[str] = None
+    ) -> SeriesNode:
+        s = self.series.get(series_uid)
+        if s is None:
+            if not _is_uid(series_uid):
+                raise ValueError(f"Invalid SeriesInstanceUID: {series_uid!r}")
+            s = SeriesNode(series_uid=series_uid, parent_study=self)
+            s.Modality = modality
+            s.SeriesDescription = desc
+            self.series[series_uid] = s
+        return s
 
-        Parameters
-        ----------
-        series_uid : str
-            The unique identifier of the series to retrieve.
-
-        Returns
-        -------
-        SeriesNode or None
-            The `SeriesNode` instance if found, or None if not present.
-
-        Examples
-        --------
-        >>> series = study.get_series("1.2.840.113619.2.55.4")
-        >>> print(series.SeriesInstanceUID)
-        '1.2.840.113619.2.55.4'
-        """
+    # --- access / dunder ---
+    def get_series(self, series_uid: str) -> Optional[SeriesNode]:
         return self.series.get(series_uid)
 
-    def __getattr__(self, name):
-        """
-        Delegates attribute access to the parent_patient if the attribute
-        is not found in the StudyNode itself.
+    def __getitem__(self, series_uid: str) -> SeriesNode:
+        return self.series[series_uid]
 
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to retrieve.
+    def __contains__(self, series_uid: str) -> bool:
+        return series_uid in self.series
 
-        Returns
-        -------
-        Any
-            The value of the requested attribute if it exists, or raises AttributeError.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute does not exist in either StudyNode or parent_patient.
-        """
-        if self.parent_patient is not None:
-            return getattr(self.parent_patient, name)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-    def __len__(self):
-        """
-        Returns the number of series associated with the study.
-
-        Returns
-        -------
-        int
-            The total number of `SeriesNode` instances in the study.
-        """
+    def __len__(self) -> int:
         return len(self.series)
 
-    def __iter__(self):
-        """
-        Iterates over all `SeriesNode` objects associated with the study.
-
-        Yields
-        ------
-        SeriesNode
-            Each series node associated with the study.
-        """
+    def __iter__(self) -> Iterator[SeriesNode]:
         return iter(self.series.values())
 
-    def __repr__(self):
-        """
-        Returns a string representation of the `StudyNode`, including the StudyInstanceUID,
-        StudyDescription, and the number of series.
+    def __getattr__(self, name: str) -> Any:
+        if self.parent_patient is not None:
+            return getattr(self.parent_patient, name)
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
-        Returns
-        -------
-        str
-            A string representation of the `StudyNode` object.
-        """
+    def __repr__(self) -> str:
         return (
-            f"StudyNode(StudyInstanceUID={self.StudyInstanceUID}, "
-            f"StudyDescription={self.StudyDescription}, "
-            f"NumSeries={len(self)})"
+            f"StudyNode(StudyInstanceUID={self.StudyInstanceUID!r}, "
+            f"StudyDescription={self.StudyDescription!r}, NumSeries={len(self)})"
         )
 
+    # --- serialization ---
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "StudyInstanceUID": self.StudyInstanceUID,
+            "StudyDescription": self.StudyDescription,
+            "series": {uid: s.to_dict() for uid, s in self.series.items()},
+        }
 
+    @classmethod
+    def from_dict(
+        cls, d: dict[str, Any], parent_patient: Optional[PatientNode] = None
+    ) -> StudyNode:
+        st = cls(
+            study_uid=d["StudyInstanceUID"],
+            study_description=d.get("StudyDescription"),
+            parent_patient=parent_patient,
+        )
+        for s in d.get("series", {}).values():
+            st.add_series(SeriesNode.from_dict(s, parent_study=st))
+        return st
+
+
+@dataclass(slots=True)
 class SeriesNode:
     """
     Represents a series in the DICOM hierarchy.
@@ -536,135 +516,110 @@ class SeriesNode:
     '1.2.3.4.5.6.7'
     """
 
-    def __init__(self, series_uid, parent_study=None):
-        """
-        Initializes the Series object with the given SeriesInstanceUID and sets
-        the default values for the other attributes.
+    series_uid: str
+    parent_study: Optional[StudyNode] = None
 
-        Parameters
-        ----------
-        series_uid : str
-            The unique identifier for the DICOM series (SeriesInstanceUID).
-        parent_study : StudyNode, optional
-            The `StudyNode` instance associated with this series. Default is None.
-        """
-        self.SeriesInstanceUID = series_uid
-        self.Modality = None
-        self.SeriesDescription = None
-        self.FrameOfReferenceUID = None
-        self.SOPInstances = []
-        self.instances = {}  # Key: SOPInstanceUID
-        self.instance_paths = []
-        self.referencing_series = []
-        self.referenced_series = []
-        self.referenced_sids = []
-        self.referencing_sids = []
-        self.frame_of_reference_registered = []
-        self.is_embedded_in_raw = False
-        self.raw_series_reference = None
-        self.parent_study = parent_study
+    # DICOM-ish exposed attributes
+    Modality: Optional[str] = None
+    SeriesDescription: Optional[str] = None
+    FrameOfReferenceUID: Optional[str] = None
 
-    def add_instance(self, instance):
-        """
-        Adds an `InstanceNode` to the series.
+    # contents & relationships
+    instances: Dict[str, InstanceNode] = field(default_factory=dict)
+    instance_paths: list[str] = field(default_factory=list)
 
-        Parameters
-        ----------
-        instance : InstanceNode
-            The `InstanceNode` object to be added to the series.
-        """
-        self.SOPInstances.append(instance.SOPInstanceUID)
-        self.instances[instance.SOPInstanceUID] = instance
-        self.instance_paths.append(instance.FilePath)
+    # cross-reference fields
+    referencing_series: list[SeriesNode] = field(default_factory=list)
+    referenced_series: list[SeriesNode] = field(default_factory=list)
+    referenced_sids: list[str] = field(default_factory=list)
+    referencing_sids: list[str] = field(default_factory=list)
+    frame_of_reference_registered: list[SeriesNode] = field(default_factory=list)
 
-    def get_instance(self, sop_instance_uid):
-        """
-        Retrieves an InstanceNode by its SOPInstanceUID.
+    is_embedded_in_raw: bool = False
+    raw_series_reference: Optional[SeriesNode] = None
 
-        Parameters
-        ----------
-        sop_instance_uid : str
-            The unique identifier of the instance to retrieve.
+    @property
+    def SeriesInstanceUID(self) -> str:
+        return self.series_uid
 
-        Returns
-        -------
-        InstanceNode or None
-            The `InstanceNode` instance if found, or None if not present.
+    @property
+    def SOPInstances(self) -> list[str]:
+        # derived to avoid duplication with `instances`
+        return list(self.instances.keys())
 
-        Examples
-        --------
-        >>> instance = series.get_instance("1.2.3.4.5.6.7")
-        >>> print(instance.sop_instance_uid)
-        '1.2.3.4.5.6.7'
-        """
+    def accept(self, visitor):
+        return visitor.visit_series(self)
+
+    # --- mutation ---
+    def add_instance(self, instance: InstanceNode, *, overwrite: bool = False) -> None:
+        uid = instance.SOPInstanceUID
+        if not _is_uid(uid):
+            raise ValueError(f"Invalid SOPInstanceUID: {uid!r}")
+        if (uid in self.instances) and not overwrite:
+            raise KeyError(f"Instance '{uid}' already exists (set overwrite=True to replace).")
+        self.instances[uid] = instance
+        instance.parent_series = self
+        if instance.FilePath:
+            self.instance_paths.append(instance.FilePath)
+
+    # --- access / dunder ---
+    def get_instance(self, sop_instance_uid: str) -> Optional[InstanceNode]:
         return self.instances.get(sop_instance_uid)
 
-    def __getattr__(self, name):
-        """
-        Delegates attribute access to the parent study. If not found, the parent study's
-        `__getattr__` will check its parent (patient).
+    def __getitem__(self, sop_instance_uid: str) -> InstanceNode:
+        return self.instances[sop_instance_uid]
 
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to retrieve.
+    def __contains__(self, sop_instance_uid: str) -> bool:
+        return sop_instance_uid in self.instances
 
-        Returns
-        -------
-        Any
-            The value of the requested attribute if it exists, or raises AttributeError.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute does not exist in this SeriesNode, the parent study, or
-            the parent patient.
-        """
-        if self.parent_study is not None:
-            return getattr(self.parent_study, name)
-
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-    def __len__(self):
-        """
-        Returns the number of instances (files) in the series.
-
-        Returns
-        -------
-        int
-            The number of instances in the series.
-        """
+    def __len__(self) -> int:
         return len(self.instances)
 
-    def __iter__(self):
-        """
-        Iterates over all `InstanceNode` objects in the series.
-
-        Yields
-        ------
-        InstanceNode
-            Each instance in the series.
-        """
+    def __iter__(self) -> Iterator[InstanceNode]:
         return iter(self.instances.values())
 
-    def __repr__(self):
-        """
-        Returns a string representation of the `SeriesNode`, including its UID, modality, and
-        number of instances, to provide a quick summary in debug outputs.
+    def __getattr__(self, name: str) -> Any:
+        if self.parent_study is not None:
+            return getattr(self.parent_study, name)
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
-        Returns
-        -------
-        str
-            A string representation of the `SeriesNode` object.
-        """
+    def __repr__(self) -> str:
         return (
-            f"SeriesNode(SeriesInstanceUID='{self.SeriesInstanceUID}', "
-            f"Modality='{self.Modality}', "
-            f"SeriesDescription='{self.SeriesDescription}', "
+            f"SeriesNode(SeriesInstanceUID={self.SeriesInstanceUID!r}, "
+            f"Modality={self.Modality!r}, SeriesDescription={self.SeriesDescription!r}, "
             f"NumInstances={len(self)})"
         )
 
+    # --- serialization ---
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "SeriesInstanceUID": self.SeriesInstanceUID,
+            "Modality": self.Modality,
+            "SeriesDescription": self.SeriesDescription,
+            "FrameOfReferenceUID": self.FrameOfReferenceUID,
+            "instances": {uid: inst.to_dict() for uid, inst in self.instances.items()},
+            "instance_paths": list(self.instance_paths),
+            "referenced_sids": list(self.referenced_sids),
+            "referencing_sids": list(self.referencing_sids),
+            "is_embedded_in_raw": self.is_embedded_in_raw,
+        }
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any], parent_study: Optional[StudyNode] = None) -> SeriesNode:
+        se = cls(series_uid=d["SeriesInstanceUID"], parent_study=parent_study)
+        se.Modality = d.get("Modality")
+        se.SeriesDescription = d.get("SeriesDescription")
+        se.FrameOfReferenceUID = d.get("FrameOfReferenceUID")
+        se.instance_paths = list(d.get("instance_paths", []))
+        se.referenced_sids = list(d.get("referenced_sids", []))
+        se.referencing_sids = list(d.get("referencing_sids", []))
+        se.is_embedded_in_raw = bool(d.get("is_embedded_in_raw", False))
+        for inst in d.get("instances", {}).values():
+            se.add_instance(InstanceNode.from_dict(inst, parent_series=se))
+        return se
+
+
+@dataclass(slots=True)
 class InstanceNode:
     """
     Represents a DICOM instance (SOP instance) in the DICOM hierarchy.
@@ -722,56 +677,57 @@ class InstanceNode:
     '/path/to/file.dcm'
     """
 
-    def __init__(self, SOPInstanceUID, FilePath, modality=None, parent_series=None):
-        self.SOPInstanceUID = SOPInstanceUID
-        self.FilePath = FilePath
-        self.Modality = modality
-        self.references = []
-        self.referenced_sop_instance_uids = []
-        self.referenced_sids = []
-        self.referenced_series = []
-        self.other_referenced_sids = []
-        self.other_referenced_series = []
-        self.referenced_instances = []
-        self.referencing_instances = []
-        self.parent_series = parent_series
+    SOPInstanceUID: str
+    FilePath: str
+    Modality: Optional[str] = None
+    parent_series: Optional[SeriesNode] = None
 
-    def __getattr__(self, name):
-        """
-        Delegates attribute access to the parent series. If not found, the parent series'
-        `__getattr__` will handle delegation up to the parent study and patient.
+    # references & relations
+    references: list[Any] = field(default_factory=list)
+    referenced_sop_instance_uids: list[str] = field(default_factory=list)
+    referenced_sids: list[str] = field(default_factory=list)
+    referenced_series: list[SeriesNode] = field(default_factory=list)
+    other_referenced_sids: list[str] = field(default_factory=list)
+    other_referenced_series: list[SeriesNode] = field(default_factory=list)
+    referenced_instances: list[InstanceNode] = field(default_factory=list)
+    referencing_instances: list[InstanceNode] = field(default_factory=list)
 
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to retrieve.
+    def accept(self, visitor):
+        return visitor.visit_instance(self)
 
-        Returns
-        -------
-        Any
-            The value of the requested attribute if it exists, or raises AttributeError.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute does not exist in this InstanceNode or the parent hierarchy.
-        """
+    def __getattr__(self, name: str) -> Any:
         if self.parent_series is not None:
             return getattr(self.parent_series, name)
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-    def __repr__(self):
-        """
-        Returns a string representation of the `InstanceNode`, including the SOPInstanceUID,
-        Modality, and file path.
-
-        Returns
-        -------
-        str
-            A string representation of the `InstanceNode` object.
-        """
+    def __repr__(self) -> str:
         return (
-            f"InstanceNode(SOPInstanceUID={self.SOPInstanceUID}, "
-            f"Modality={self.Modality}, FilePath={self.FilePath})"
+            f"InstanceNode(SOPInstanceUID={self.SOPInstanceUID!r}, "
+            f"Modality={self.Modality!r}, FilePath={self.FilePath!r})"
         )
+
+    # --- serialization ---
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "SOPInstanceUID": self.SOPInstanceUID,
+            "FilePath": self.FilePath,
+            "Modality": self.Modality,
+            "referenced_sop_instance_uids": list(self.referenced_sop_instance_uids),
+            "referenced_sids": list(self.referenced_sids),
+            "other_referenced_sids": list(self.other_referenced_sids),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, d: dict[str, Any], parent_series: Optional[SeriesNode] = None
+    ) -> InstanceNode:
+        inst = cls(
+            SOPInstanceUID=d["SOPInstanceUID"],
+            FilePath=d["FilePath"],
+            Modality=d.get("Modality"),
+            parent_series=parent_series,
+        )
+        inst.referenced_sop_instance_uids = list(d.get("referenced_sop_instance_uids", []))
+        inst.referenced_sids = list(d.get("referenced_sids", []))
+        inst.other_referenced_sids = list(d.get("other_referenced_sids", []))
+        return inst
