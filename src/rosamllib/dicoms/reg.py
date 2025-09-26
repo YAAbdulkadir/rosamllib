@@ -248,7 +248,7 @@ class REG:
             image_info = {}
             if "MatrixRegistrationSequence" in sequence_item:
                 # Handle matrix-based transformation
-                self.extract_matrix_transformation(sequence_item.MatrixRegistrationSequence, i)
+                self.extract_matrix_transformation(sequence_item.MatrixRegistrationSequence)
 
             if "DeformableRegistrationGridSequence" in sequence_item:
                 # Handle grid-based transformation
