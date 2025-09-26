@@ -1,16 +1,19 @@
 import os
 import time
 import traceback
-from typing import List, Optional, Union
 import graphviz
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+import multiprocessing as mp
 from io import BytesIO
-from functools import partial
+from functools import partial, lru_cache
+from typing import Iterable, List, Optional, Set, Union, Any, Dict
+from collections import defaultdict, deque
+from itertools import chain
 from pydicom import dcmread
-from pydicom.tag import Tag
-from pydicom.sequence import Sequence
+from pydicom.tag import Tag, BaseTag
+from pydicom.sequence import Sequence as DicomSequence
 from pydicom.datadict import keyword_for_tag, tag_for_keyword, dictionary_VR
 from rosamllib.readers import (
     DICOMImageReader,
@@ -25,13 +28,20 @@ from rosamllib.readers import (
 from rosamllib.constants import VR_TO_DTYPE
 from rosamllib.readers.dicom_nodes import (
     DatasetNode,
-    PatientNode,
-    StudyNode,
     SeriesNode,
     InstanceNode,
 )
-from rosamllib.utils import validate_dicom_path, query_df, parse_vr_value
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from rosamllib.utils import (
+    validate_dicom_path,
+    query_df,
+    parse_vr_value,
+    get_referenced_sop_instance_uids,
+    extract_rtstruct_for_uids,
+    deprecated,
+)
+from rosamllib.readers.query_dicom import query_instances, QueryOptions
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from string import hexdigits
 
 
 def in_jupyter():
@@ -74,174 +84,266 @@ else:
     from tqdm import tqdm
 
 
-def get_referencing_items(node, modality=None, level="INSTANCE"):
+@lru_cache(maxsize=None)
+def _tag_info(col: str):
+    t = tag_for_keyword(col)
+    if t:
+        return (t, dictionary_VR(t), col)  # (Tag, VR, keyword)
+    try:
+        g, e = col.split(",")
+        t = Tag((int(g, 16), int(e, 16)))
+        return (t, dictionary_VR(t), col)
+    except Exception:
+        return (None, None, col)
+
+
+# Core, always-needed keywords
+CORE_TAGS = [
+    "SOPInstanceUID",
+    "SeriesInstanceUID",
+    "StudyInstanceUID",
+    "PatientID",
+    "PatientName",
+    "StudyDescription",
+    "SeriesDescription",
+    "FrameOfReferenceUID",
+    "Modality",
+]
+
+# Extra sequences needed for RT objects (plan/dose/record + shared)
+RT_COMMON_SEQ = [
+    # Common “Referenced*” containers frequently used across RT objects
+    "ReferencedStructureSetSequence",
+    "ReferencedDoseSequence",
+    "ReferencedRTPlanSequence",
+]
+
+# Extra sequences specifically needed to fully resolve RTSTRUCT references & FoRs
+RTSTRUCT_SEQ = [
+    "ReferencedFrameOfReferenceSequence",
+    "RTReferencedStudySequence",
+    "RTReferencedSeriesSequence",
+    "ROIContourSequence",
+    "ContourSequence",
+    "ContourImageSequence",
+    # Some writers also embed in the above paths only;
+    # listing them here ensures the full chain gets parsed.
+]
+
+# Extra sequences for SEG
+SEG_SEQ = [
+    "ReferencedSeriesSequence",
+    "ReferencedInstanceSequence",
+]
+
+
+def _parse_int_flex(x) -> int:
+    """Parse int from diverse formats: int, '0x..', hex '0010', or decimal '16'."""
+    if isinstance(x, int):
+        return x
+    s = str(x).strip().lower()
+    # strip surrounding parentheses if any
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    # remove spaces
+    s = s.replace(" ", "")
+    # hex with 0x
+    if s.startswith("0x"):
+        return int(s, 16)
+    # pure hex? (all chars hex and typical length <= 4)
+    if all(c in hexdigits for c in s):
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
+    # fallback decimal
+    return int(s, 10)
+
+
+def _to_tag(obj) -> Optional[Tag]:
     """
-    Retrieves all referencing items (instances or series) for a given node.
-
-    Parameters
-    ----------
-    node : InstanceNode or SeriesNode
-        The starting node for searching referencing items.
-    modality : str, optional
-        Modality to filter the referencing items (e.g., 'CT', 'MR').
-    level : str, {'INSTANCE', 'SERIES'}
-        Level at which to retrieve referencing items.
-
-    Returns
-    -------
-    list
-        A list of referencing InstanceNode or SeriesNode objects.
+    Return a pydicom Tag for many input shapes, or None if unresolvable.
+    Accepts keyword, Tag, int, (g,e) tuple, 'GGGG,EEEE', '(GGGG, EEEE)', '(16, 32)', '00100020'.
     """
-    if level not in {"INSTANCE", "SERIES"}:
-        raise ValueError("level must be either 'INSTANCE' or 'SERIES'")
+    if obj is None:
+        return None
 
-    referencing_items = []
+    # already a Tag
+    if isinstance(obj, BaseTag):
+        return Tag(obj)
 
-    if isinstance(node, InstanceNode):
-        # Get instances that reference this instance
-        if level == "INSTANCE":
-            referencing_items = node.referencing_instances
-        else:  # level == "SERIES"
-            referencing_items = node.parent_series.referencing_series if node.parent_series else []
+    # keyword?
+    tnum = tag_for_keyword(str(obj))
+    if tnum:
+        return Tag(tnum)
 
-    elif isinstance(node, SeriesNode):
-        # Get referencing instances
-        referencing_instances = []
-        for inst in node.instances.values():
-            referencing_instances.extend(inst.referencing_instances)
-        referencing_instances = list(set(referencing_instances))
-        if level == "INSTANCE":
-            referencing_items = referencing_instances
-        else:  # level == "SERIES"
-            referencing_items = list(set([item.parent_series for item in referencing_instances]))
+    # tuple?
+    if isinstance(obj, tuple) and len(obj) == 2:
+        try:
+            g = _parse_int_flex(obj[0])
+            e = _parse_int_flex(obj[1])
+            return Tag((g, e))
+        except Exception:
+            return None
 
+    # string forms
+    if isinstance(obj, str):
+        s = obj.strip()
+        # strip parentheses like "(16, 32)" or "(0010, 0020)"
+        if s.startswith("(") and s.endswith(")"):
+            s = s[1:-1]
+        s = s.strip()
+        s_wo_spaces = s.replace(" ", "")
+
+        # 'GGGG,EEEE' or '16,32'
+        if "," in s_wo_spaces:
+            try:
+                g_str, e_str = s_wo_spaces.split(",", 1)
+                g = _parse_int_flex(g_str)
+                e = _parse_int_flex(e_str)
+                return Tag((g, e))
+            except Exception:
+                return None
+
+        # '00100020' (8 hex chars)
+        if len(s_wo_spaces) == 8 and all(c in hexdigits for c in s_wo_spaces):
+            try:
+                g = int(s_wo_spaces[:4], 16)
+                e = int(s_wo_spaces[4:], 16)
+                return Tag((g, e))
+            except Exception:
+                return None
+
+        # try as a single int (decimal or hex)
+        try:
+            return Tag(_parse_int_flex(s_wo_spaces))
+        except Exception:
+            return None
+
+    # last resort: try Tag(obj)
+    try:
+        return Tag(obj)
+    except Exception:
+        return None
+
+
+# def _as_specific_key(tag_like: Any) -> str:
+#     """
+#     Return a string acceptable by pydicom 'specific_tags':
+#     - DICOM keyword ('PatientID') if resolvable
+#     - otherwise canonical 'GGGG,EEEE' uppercase hex
+#     """
+#     t, _vr, key = _tag_info(str(tag_like))
+#     if t is not None:
+#         # keyword path; keep the keyword (key) pydicom accepts
+#         return key
+#     # If keyword lookup failed, try to normalize "GGGG,EEEE" to uppercase
+#     try:
+#         g, e = key.split(",")
+#         return f"{int(g,16):04X},{int(e,16):04X}"
+#     except Exception:
+#         # Last resort: return original; pydicom will ignore unknowns
+#         return key
+
+
+def _as_specific_key(tag_like: Any) -> str:
+    t = _to_tag(tag_like)
+    if t is not None:
+        return f"{int(t.group):04X},{int(t.element):04X}"
+    # fall back trying to preserve keyword if resolvable
+    tnum = tag_for_keyword(str(tag_like))
+    if tnum:
+        return keyword_for_tag(tnum) or f"{int(Tag(tnum).group):04X},{int(Tag(tnum).element):04X}"
+    # last resort: return original string
+    return str(tag_like)
+
+
+def _build_specific_tags_set(user_tags: Optional[Iterable[Any]]) -> set:
+    wanted = set()
+    # core basics
+    for k in CORE_TAGS:
+        t = _to_tag(k)
+        if t is not None:
+            wanted.add(t)
+    # user-specified
+    if user_tags:
+        for u in user_tags:
+            t = _to_tag(u)
+            if t is not None:
+                wanted.add(t)
+    return wanted
+
+
+def _extend_for_modalities(
+    tag_set: Set[Tag], *, rt_common=False, rtstruct=False, seg=False
+) -> None:
+    if rt_common:
+        for k in RT_COMMON_SEQ:
+            t = _to_tag(k)
+            tag_set.add(t) if t else None
+    if rtstruct:
+        for k in RTSTRUCT_SEQ:
+            t = _to_tag(k)
+            tag_set.add(t) if t else None
+    if seg:
+        for k in SEG_SEQ:
+            t = _to_tag(k)
+            tag_set.add(t) if t else None
+
+
+def _build_specific_tags(
+    user_tags: Optional[Iterable[Any]] = None,
+    *,
+    include_rt_common: bool = False,
+    include_rtstruct: bool = False,
+    include_seg: bool = False,
+) -> List[str]:
+    """
+    Compose a deduped list for dcmread(specific_tags=...).
+    """
+    wanted: Set[str] = set(_as_specific_key(t) for t in CORE_TAGS)
+
+    if user_tags:
+        for t in user_tags:
+            wanted.add(_as_specific_key(t))
+
+    if include_rt_common:
+        for t in RT_COMMON_SEQ:
+            wanted.add(_as_specific_key(t))
+    if include_rtstruct:
+        for t in RTSTRUCT_SEQ:
+            wanted.add(_as_specific_key(t))
+    if include_seg:
+        for t in SEG_SEQ:
+            wanted.add(_as_specific_key(t))
+
+    return sorted(wanted)
+
+
+def _max_workers_io():
+    # IO-bound heuristic
+    return min(32, (mp.cpu_count() or 4) * 5)
+
+
+def _max_workers_cpu():
+    return max(1, (os.cpu_count() or 4))
+
+
+def _choose_executor(num_tasks: int, *, prefer: str = "auto", threshold: int = 3000):
+    """
+    Return (ExecutorClass, max_workers, use_processes) based on task count.
+    - prefer='threads' or 'processes' to force a mode
+    - prefer='auto' chooses processes when num_tasks >= threshold
+    """
+    if prefer == "threads":
+        return ThreadPoolExecutor, _max_workers_io(), False
+    if prefer == "processes":
+        return ProcessPoolExecutor, _max_workers_cpu(), True
+    # auto
+    if num_tasks >= threshold:
+        return ProcessPoolExecutor, _max_workers_cpu(), True
     else:
-        raise TypeError("Expected an InstanceNode or SeriesNode.")
-
-    # Filter by modality if specified
-    if modality:
-        referencing_items = [
-            item for item in referencing_items if getattr(item, "Modality", None) == modality
-        ]
-
-    return referencing_items
-
-
-def get_referenced_items(node, modality=None, level="INSTANCE"):
-    """
-    Retrieves all referenced items (instances or series) for a given node.
-
-    Parameters
-    ----------
-    node : InstanceNode or SeriesNode
-        The starting node for searching referenced items.
-    modality : str, optional
-        Modality to filter the referenced items (e.g., 'CT', 'MR').
-    level : str, {'INSTANCE', 'SERIES'}
-        Level at which to retrieve referenced items.
-
-    Returns
-    -------
-    list
-        A list of referenced InstanceNode or SeriesNode objects.
-    """
-    if level not in {"INSTANCE", "SERIES"}:
-        raise ValueError("level must be either 'INSTANCE' or 'SERIES'")
-
-    referenced_items = []
-    if isinstance(node, InstanceNode):
-        # Get directly referenced instances or series
-        if level == "INSTANCE":
-            referenced_items = node.referenced_instances
-        else:  # level == "SERIES"
-            referenced_items = node.referenced_series
-
-    elif isinstance(node, SeriesNode):
-        # Get referenced series
-        if level == "INSTANCE":
-            referenced_items = []
-            for series in node.referenced_series:
-                referenced_items.extend(series.instances.values())
-        else:  # level == "SERIES"
-            referenced_items = node.referenced_series
-
-    else:
-        raise TypeError("Expected an InstanceNode or SeriesNode.")
-
-    # Filter by modality if specified
-    if modality:
-        referenced_items = [
-            item for item in referenced_items if getattr(item, "Modality", None) == modality
-        ]
-
-    return referenced_items
-
-
-def get_referenced_sop_instance_uids(ds):
-    """
-    Extracts referenced SOPInstanceUIDs from RTSTRUCT, RTPLAN, and RTDOSE DICOM files.
-
-    This method scans the DICOM dataset for references to other DICOM instances and returns
-    the list of referenced SOPInstanceUIDs.
-
-    Parameters
-    ----------
-    ds : pydicom.Dataset
-        The DICOM dataset to extract references from.
-
-    Returns
-    -------
-    list of str
-        A list of referenced SOPInstanceUIDs from the DICOM dataset.
-
-    Examples
-    --------
-    >>> uids = DICOMLoader._get_referenced_sop_instance_uids(ds)
-    >>> print(uids)
-    ['1.2.3.4.5.6.7', '1.2.3.4.5.6.8']
-    """
-    referenced_uids = set()
-    if ds.Modality == "RTSTRUCT":
-        if hasattr(ds, "ReferencedFrameOfReferenceSequence"):
-            for item in ds.ReferencedFrameOfReferenceSequence:
-                if hasattr(item, "RTReferencedStudySequence"):
-                    for study_item in item.RTReferencedStudySequence:
-                        if hasattr(study_item, "RTReferencedSeriesSequence"):
-                            for series_item in study_item.RTReferencedSeriesSequence:
-                                if hasattr(series_item, "ContourImageSequence"):
-                                    for contour_item in series_item.ContourImageSequence:
-                                        referenced_uids.add(contour_item.ReferencedSOPInstanceUID)
-        if hasattr(ds, "ROIContourSequence"):
-            for roi_item in ds.ROIContourSequence:
-                if hasattr(roi_item, "ContourSequence"):
-                    for contour_seq in roi_item.ContourSequence:
-                        if hasattr(contour_seq, "ContourImageSequence"):
-                            for image_seq in contour_seq.ContourImageSequence:
-                                referenced_uids.add(image_seq.ReferencedSOPInstanceUID)
-    elif ds.Modality == "SEG":
-        if hasattr(ds, "ReferencedSeriesSequence"):
-            for item in ds.ReferencedSeriesSequence:
-                if hasattr(item, "ReferencedInstanceSequence"):
-                    for ref_seq in item.ReferencedInstanceSequence:
-                        referenced_uids.add(ref_seq.ReferencedSOPInstanceUID)
-
-    else:
-        if hasattr(ds, "ReferencedStructureSetSequence"):
-            for item in ds.ReferencedStructureSetSequence:
-                if hasattr(item, "ReferencedSOPInstanceUID"):
-                    referenced_uids.add(item.ReferencedSOPInstanceUID)
-
-        if hasattr(ds, "ReferencedDoseSequence"):
-            for item in ds.ReferencedDoseSequence:
-                if hasattr(item, "ReferencedSOPInstanceUID"):
-                    referenced_uids.add(item.ReferencedSOPInstanceUID)
-
-        if hasattr(ds, "ReferencedRTPlanSequence"):
-            for item in ds.ReferencedRTPlanSequence:
-                if hasattr(item, "ReferencedSOPInstanceUID"):
-                    referenced_uids.add(item.ReferencedSOPInstanceUID)
-
-    return list(referenced_uids)
+        return ThreadPoolExecutor, _max_workers_io(), False
 
 
 def get_metadata(ds, tags_to_index):
@@ -256,17 +358,21 @@ def get_metadata(ds, tags_to_index):
         "PatientID": getattr(ds, "PatientID", None),
         "PatientName": getattr(ds, "PatientName", None),
     }
-    for tag in tags_to_index:
-        try:
-            tag_obj = Tag(tag)
-            vr = dictionary_VR(tag_obj)
-            value = ds[tag_obj].value if tag_obj in ds else None
-            if isinstance(value, Sequence) and vr == "SQ":
-                metadata[keyword_for_tag(tag) or tag] = (ds[tag_obj].to_json()) if value else None
-            else:
-                metadata[keyword_for_tag(tag) or tag] = parse_vr_value(vr, value)
-        except Exception:
-            metadata[tag] = None
+
+    if tags_to_index is not None:
+        for tag in tags_to_index:
+            try:
+                tag_obj = Tag(tag)
+                vr = dictionary_VR(tag_obj)
+                value = ds[tag_obj].value if tag_obj in ds else None
+                if isinstance(value, DicomSequence) and vr == "SQ":
+                    metadata[keyword_for_tag(tag) or tag] = (
+                        (ds[tag_obj].to_json()) if value else None
+                    )
+                else:
+                    metadata[keyword_for_tag(tag) or tag] = parse_vr_value(vr, value)
+            except Exception:
+                metadata[tag] = None
 
     return metadata
 
@@ -277,7 +383,10 @@ def process_standard_dicom(ds, filepath, tags_to_index):
     instance_dict = {"FilePath": filepath, **metadata}
 
     if modality in ["RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
-        instance_dict["ReferencedSOPInstanceUIDs"] = get_referenced_sop_instance_uids(ds)
+        refs_map = get_referenced_sop_instance_uids(ds)
+        instance_dict["ReferencedSOPInstanceUIDs"] = list(chain.from_iterable(refs_map.values()))
+        if modality == "RTSTRUCT":
+            instance_dict["RTStructFoRUIDs"] = extract_rtstruct_for_uids(ds)
 
     return instance_dict
 
@@ -317,9 +426,11 @@ def process_raw_file(filepath, tags_to_index):
                 "raw_series_reference_uid": instance_dict["SeriesInstanceUID"],
             }
             if embedded_instance_dict["Modality"] in ["RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
-                embedded_instance_dict["ReferencedSOPInstanceUIDs"] = (
-                    get_referenced_sop_instance_uids(embedded_ds)
+                refs_map = get_referenced_sop_instance_uids(embedded_ds)
+                embedded_instance_dict["ReferencedSOPInstanceUIDs"] = list(
+                    chain.from_iterable(refs_map.values())
                 )
+
             elif embedded_instance_dict["Modality"] == "REG":
                 embedded_reg = REGReader(embedded_ds).read()
                 embedded_instance_dict["ReferencedSeriesUIDs"] = (
@@ -343,16 +454,24 @@ def process_seg_file(filepath, tags_to_index):
         ref_seq = seg.ReferencedSeriesSequence[0]
         if hasattr(ref_seq, "SeriesInstanceUID"):
             instance_dict["ReferencedSeriesUIDs"] = ref_seq.SeriesInstanceUID
-    instance_dict["ReferencedSOPInstanceUIDs"] = get_referenced_sop_instance_uids(seg)
+    refs_map = get_referenced_sop_instance_uids(seg)
+    instance_dict["ReferencedSOPInstanceUIDs"] = list(chain.from_iterable(refs_map.values()))
 
     return instance_dict
 
 
 def process_file(filepath, tags_to_index):
     try:
-        ds = dcmread(filepath, stop_before_pixels=True)
+        specific = _build_specific_tags_set(tags_to_index)
+        ds = dcmread(filepath, stop_before_pixels=True, specific_tags=specific)
+
         modality = getattr(ds, "Modality", None)
         embedded_instances = []
+
+        # RT/SEG: re-read headers fully so nested sequences are available
+        if modality in ["RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD", "SEG"]:
+            ds = dcmread(filepath, stop_before_pixels=True)
+
         if modality in ["CT", "MR", "PT", "RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
             instance_dict = process_standard_dicom(ds, filepath, tags_to_index)
         elif modality == "REG":
@@ -364,11 +483,11 @@ def process_file(filepath, tags_to_index):
         else:
             return []
 
-        metadata_list = [instance_dict]
-        for embedded_inst_dict in embedded_instances:
-            metadata_list.append(embedded_inst_dict)
-        return metadata_list
-    except Exception:
+        out = [instance_dict]
+        out.extend(embedded_instances)
+        return out
+    except Exception as e:
+        print(e)
         return []
 
 
@@ -464,8 +583,12 @@ class DICOMLoader:
         """
         self.path = path
         self.dicom_files = {}
-        self.dataset = None
         self.metadata_df = None
+        # Initialize the DatasetNode as the root of the hierarchy
+        dataset_id = "DICOM_Dataset"
+        dataset_name = "DICOM Collection"
+        self.dataset = DatasetNode(dataset_id, dataset_name)
+        self._sop_to_instance = {}  # fast lookup: SOPInstanceUID -> InstanceNode
 
     def load(self, tags_to_index=None):
         """
@@ -512,7 +635,7 @@ class DICOMLoader:
                 self.load_from_directory(self.path, tags_to_index)
             else:
                 self.load_file(self.path, tags_to_index)
-            self._build_hierarchical_structure()
+            # self._build_hierarchical_structure()
 
         except Exception as e:
             print(f"Error loading DICOM files: {e}")
@@ -585,82 +708,125 @@ class DICOMLoader:
 
     def _load_files(self, files, tags_to_index=None):
         process_file_with_tags = partial(process_file, tags_to_index=tags_to_index)
-        with ThreadPoolExecutor() as executor:
-            # with ProcessPoolExecutor() as executor:
-            results = list(
-                tqdm(
-                    executor.map(process_file_with_tags, files),
-                    total=len(files),
-                    desc="Loading DICOM files",
-                    unit="file",
-                )
-            )
 
-        exclude_keys = [
+        unresolved_raw_links = []
+        metadata_rows = []
+        exclude_keys = {
             "FilePath",
             "ReferencedSOPInstanceUIDs",
             "ReferencedSeriesUIDs",
             "OtherReferencedSeriesUIDs",
             "is_embedded_in_raw",
             "raw_series_reference_uid",
-        ]
-        metadata_list = []
-        for result in results:
-            for inst_dict in result:
-                sop_instance_uid = inst_dict["SOPInstanceUID"]
-                patient_id = inst_dict["PatientID"]
-                series_uid = inst_dict["SeriesInstanceUID"]
-                modality = inst_dict["Modality"]
-                filepath = inst_dict["FilePath"]
-                if patient_id not in self.dicom_files:
-                    self.dicom_files[patient_id] = {}
-                if series_uid not in self.dicom_files[patient_id]:
-                    series = SeriesNode(series_uid)
-                    series.PatientID = patient_id
-                    series.Modality = modality
-                    series.PatientName = inst_dict["PatientName"]
-                    series.StudyInstanceUID = inst_dict["StudyInstanceUID"]
-                    series.StudyDescription = inst_dict["StudyDescription"]
-                    series.SeriesDescription = inst_dict["SeriesDescription"]
-                    series.FrameOfReferenceUID = inst_dict["FrameOfReferenceUID"]
-                    self.dicom_files[patient_id][series_uid] = series
-                series = self.dicom_files[patient_id][series_uid]
-                instance_node = InstanceNode(
-                    sop_instance_uid, filepath, modality=modality, parent_series=series
-                )
-                series.add_instance(instance_node)
-                if inst_dict.get("ReferencedSOPInstanceUIDs"):
-                    instance_node.referenced_sop_instance_uids = inst_dict[
-                        "ReferencedSOPInstanceUIDs"
-                    ]
-                if modality in ["REG", "SEG"]:
-                    instance_node.referenced_sids.append(inst_dict["ReferencedSeriesUIDs"])
-                    if modality == "REG":
-                        instance_node.other_referenced_sids.append(
-                            inst_dict["OtherReferencedSeriesUIDs"]
+            "RTStructFoRUIDs",
+        }
+
+        Exec, max_workers, is_proc = _choose_executor(len(files), prefer="auto", threshold=10000)
+
+        with Exec(max_workers=max_workers) as ex, tqdm(
+            total=len(files), desc="Loading DICOM files", unit="file"
+        ) as pbar:
+
+            futures = [ex.submit(process_file_with_tags, f) for f in files]
+            for fut in as_completed(futures):
+                result = fut.result()  # list[dict] or []
+                for inst_dict in result:
+                    if not inst_dict or "SOPInstanceUID" not in inst_dict:
+                        continue
+
+                    sop_instance_uid = inst_dict["SOPInstanceUID"]
+                    patient_id = inst_dict.get("PatientID")
+                    patient_name = inst_dict.get("PatientName")
+                    study_uid = inst_dict.get("StudyInstanceUID")
+                    study_desc = inst_dict.get("StudyDescription")
+                    series_uid = inst_dict.get("SeriesInstanceUID")
+                    series_desc = inst_dict.get("SeriesDescription")
+                    modality = (inst_dict.get("Modality") or "").upper()
+                    filepath = inst_dict.get("FilePath")
+
+                    if patient_id is None or series_uid is None:
+                        continue
+
+                    if patient_id not in self.dicom_files:
+                        self.dicom_files[patient_id] = {}
+
+                    patient_node = self.dataset.get_or_create_patient(patient_id, patient_name)
+                    study_node = patient_node.get_or_create_study(study_uid, study_desc)
+
+                    if series_uid not in self.dicom_files[patient_id]:
+                        series = study_node.get_or_create_series(series_uid, modality, series_desc)
+                        series.Modality = modality
+                        series.FrameOfReferenceUID = inst_dict.get("FrameOfReferenceUID")
+                        self.dicom_files[patient_id][series_uid] = series
+                    series = self.dicom_files[patient_id][series_uid]
+                    instance_node = series.get_instance(sop_instance_uid)
+                    if not instance_node:
+                        instance_node = InstanceNode(
+                            sop_instance_uid, filepath, Modality=modality, parent_series=series
                         )
-                if inst_dict.get("is_embedded_in_raw"):
-                    series.is_embedded_in_raw = True
-                    raw_series_reference_uid = inst_dict["raw_series_reference_uid"]
-                    series.raw_series_reference = self.dicom_files[patient_id][
-                        raw_series_reference_uid
-                    ]
-                metadata_list.append(
-                    {key: val for key, val in inst_dict.items() if key not in exclude_keys}
-                )
+                    if modality == "RTSTRUCT":
+                        instance_node.FrameOfReferenceUIDs = list(
+                            inst_dict.get("RTStructFoRUIDs") or []
+                        )
+                    series.add_instance(instance_node, overwrite=True)
+
+                    refs = inst_dict.get("ReferencedSOPInstanceUIDs")
+                    if refs:
+                        instance_node.referenced_sop_instance_uids = refs
+
+                    if modality in {"REG", "SEG"}:
+                        ref_sid = inst_dict.get("ReferencedSeriesUIDs")
+                        if ref_sid:
+                            instance_node.referenced_sids.append(ref_sid)
+                        if modality == "REG":
+                            other_sid = inst_dict.get("OtherReferencedSeriesUIDs")
+                            if other_sid:
+                                instance_node.other_referenced_sids.append(other_sid)
+
+                    if inst_dict.get("is_embedded_in_raw"):
+                        series.is_embedded_in_raw = True
+                        unresolved_raw_links.append(
+                            (patient_id, series, inst_dict.get("raw_series_reference_uid"))
+                        )
+
+                    metadata_rows.append(
+                        {k: v for k, v in inst_dict.items() if k not in exclude_keys}
+                    )
+
+                pbar.update(1)
+
+        # Resolve RAW parents (after all series exist)
+        for pid, child_series, raw_sid in unresolved_raw_links:
+            if raw_sid:
+                parent = self.dicom_files.get(pid, {}).get(raw_sid)
+                if parent:
+                    child_series.raw_series_reference = parent
+
+        # Wire associations
         DICOMLoader._associate_dicoms(self.dicom_files)
 
-        self.metadata_df = pd.DataFrame(metadata_list)
+        # Build SOP index
+        self._sop_to_instance = {
+            str(sop_uid): inst
+            for _pid, sdict in self.dicom_files.items()
+            for _sid, series in sdict.items()
+            for sop_uid, inst in series.instances.items()
+        }
 
+        # Build DF
+        self.metadata_df = pd.DataFrame(metadata_rows)
+
+        # 8) dtype normalization driven by VR
         for col in self.metadata_df.columns:
-            try:
-                vr = dictionary_VR(Tag(tag_for_keyword(col))) if col != "InstanceNode" else None
-            except TypeError:
-                vr = dictionary_VR(Tag(col)) if col != "InstanceNode" else None
+            if col == "InstanceNode":
+                continue
+            # try keyword first
+            tag, vr, _ = _tag_info(col)
             dtype = VR_TO_DTYPE.get(vr, object)
             if dtype == "date":
                 self.metadata_df[col] = pd.to_datetime(self.metadata_df[col], errors="coerce")
             elif dtype == "time":
+                # conservative: keep as string if parsing fails
                 self.metadata_df[col] = pd.to_datetime(
                     self.metadata_df[col], format="%H:%M:%S", errors="coerce"
                 ).dt.time
@@ -673,177 +839,212 @@ class DICOMLoader:
     def _associate_dicoms(dicom_files):
         """
         Associates DICOM files based on referenced SOPInstanceUIDs and SeriesInstanceUIDs.
-
-        This method builds lookup tables for SOPInstanceUIDs and SeriesInstanceUIDs and
-        associates referenced DICOM instances and series by establishing connections between
-        related DICOMs.
-
-        Parameters
-        ----------
-        dicom_files : dict
-            A dictionary where the processed DICOM data is stored, indexed by PatientID and
-            SeriesInstanceUID.
-
-        Examples
-        --------
-        >>> DICOMLoader._associate_dicoms(dicom_files)
+        - Builds SOP/Series/FrameOfReference maps
+        - Wires instance<->instance, instance->series, and series<->series edges
+        - Populates reverse edges for efficient "referencing" queries
+        - Ensures FoR connectivity is symmetric
+        - NEW: RTSTRUCT InstanceNode.FrameOfReferenceUIDs is populated as the union of
+            FoRs parsed from the DICOM and FoRs of referenced image series.
         """
-        # Create a lookup table for all SOPInstanceUIDs and SeriesInstanceUIDs across all patients
+        # sidecar state for fast identity de-dup per list
+        _seen_map = {}
+
+        def _append_unique(lst, obj):
+            if obj is None:
+                return
+            lid = id(lst)
+            s = _seen_map.get(lid)
+            if s is None:
+                s = set(id(x) for x in lst)
+                _seen_map[lid] = s
+            oid = id(obj)
+            if oid not in s:
+                lst.append(obj)
+                s.add(oid)
+
+        # Build lookup maps
         sop_instance_uid_map = {}
         series_uid_map = {}
         frame_of_reference_uid_map = {}
 
-        # Build the lookup maps
-        for patient_id, series_dict in dicom_files.items():
-            for series_uid, series in series_dict.items():
-                series_uid_map[series_uid] = series
-                for sop_instance_uid, instance_node in series.instances.items():
-                    sop_instance_uid_map[sop_instance_uid] = instance_node
+        for _pid, series_dict in dicom_files.items():
+            for sid, series in series_dict.items():
+                series_uid_map[sid] = series
 
-                # Map each FrameOfReferenceUID to a list of series sharing the same
-                # FrameOfReferenceUID
-                if series.FrameOfReferenceUID:
-                    if series.FrameOfReferenceUID not in frame_of_reference_uid_map:
-                        frame_of_reference_uid_map[series.FrameOfReferenceUID] = []
-                    frame_of_reference_uid_map[series.FrameOfReferenceUID].append(series)
+                # ensure series containers exist
+                series.referencing_series = getattr(series, "referencing_series", [])
+                series.referenced_series = getattr(series, "referenced_series", [])
+                series.frame_of_reference_registered = getattr(
+                    series, "frame_of_reference_registered", []
+                )
 
-        # Now, associate instances based on their references
-        for patient_id, series_dict in dicom_files.items():
-            for series_uid, series in series_dict.items():
-                for sop_uid, instance in series.instances.items():
-                    modality = instance.Modality
+                for sop_uid, inst in series.instances.items():
+                    sop_instance_uid_map[sop_uid] = inst
 
-                    # Initialize referenced_instances list
-                    instance.referenced_instances = []
-
-                    # General handling for referenced SOPInstanceUIDs
-                    for ref_sop_uid in instance.referenced_sop_instance_uids:
-                        ref_instance = sop_instance_uid_map.get(ref_sop_uid)
-                        if ref_instance:
-                            if ref_instance not in instance.referenced_instances:
-                                instance.referenced_instances.append(ref_instance)
-                            if ref_instance.parent_series not in instance.referenced_series:
-                                instance.referenced_series.append(ref_instance.parent_series)
-                            if instance not in ref_instance.referencing_instances:
-                                ref_instance.referencing_instances.append(instance)
-
-                        else:
-                            # Reference to an instance not in dataset
-                            pass
-
-                    # Modality-specific associations
-                    if modality in ["RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
-                        # RTSTRUCT references images via referenced_sop_instance_uids
-                        referenced_series_uids = set()
-
-                        for ref_instance in instance.referenced_instances:
-                            ref_series_uid = ref_instance.parent_series.SeriesInstanceUID
-                            referenced_series_uids.add(ref_series_uid)
-
-                        for ref_sid in referenced_series_uids:
-                            instance.referenced_sids.append(ref_sid)
-                            ref_series = series_uid_map.get(ref_sid)
-                            if ref_series:
-                                if ref_series not in instance.referenced_series:
-                                    instance.referenced_series.append(ref_series)
-
-                    elif modality == "REG":
-                        # REG references fixed image (referenced_sids) and
-                        # moving image (other_referenced_sids)
-                        ref_sids = instance.referenced_sids
-                        other_ref_sids = instance.other_referenced_sids
-
-                        if ref_sids:
-                            for ref_sid in ref_sids:
-                                ref_series = series_uid_map.get(ref_sid)
-                                if ref_series:
-                                    instance.referenced_series.append(ref_series)
-
-                        if other_ref_sids:
-                            for other_ref_sid in other_ref_sids:
-                                other_ref_series = series_uid_map.get(other_ref_sid)
-                                if other_ref_series:
-                                    instance.other_referenced_series.append(other_ref_series)
-
-                    elif modality == "SEG":
-                        ref_sids = instance.referenced_sids
-                        if ref_sids:
-                            for ref_sid in ref_sids:
-                                ref_series = series_uid_map.get(ref_sid)
-                                if ref_series and ref_series not in instance.referenced_series:
-                                    instance.referenced_series.append(ref_series)
-
-                # Associate by FrameOfReferenceUID
-                if series.FrameOfReferenceUID:
-                    # Get all series sharing the same FrameOfReferenceUID
-                    frame_of_reference_series = frame_of_reference_uid_map.get(
-                        series.FrameOfReferenceUID, []
+                    # ensure instance containers exist
+                    inst.referenced_instances = getattr(inst, "referenced_instances", [])
+                    inst.referencing_instances = getattr(inst, "referencing_instances", [])
+                    inst.referenced_series = getattr(inst, "referenced_series", [])
+                    inst.other_referenced_series = getattr(inst, "other_referenced_series", [])
+                    inst.referenced_sop_instance_uids = getattr(
+                        inst, "referenced_sop_instance_uids", []
                     )
-                    series.frame_of_reference_registered = [
-                        s
-                        for s in frame_of_reference_series
-                        if s.SeriesInstanceUID != series.SeriesInstanceUID
-                    ]
+                    inst.referenced_sids = getattr(inst, "referenced_sids", [])
+                    inst.other_referenced_sids = getattr(inst, "other_referenced_sids", [])
 
-    def _build_hierarchical_structure(self):
-        """
-        Builds a hierarchical structure of DatasetNode, PatientNode, StudyNode, SeriesNode,
-        and InstanceNode from the existing self.dicom_files.
-
-        This method populates self.dataset with a DatasetNode instance containing PatientNode
-        instances, and subsequently, the entire hierarchical structure.
-
-        Returns
-        -------
-        None
-        """
-        # Initialize the DatasetNode as the root of the hierarchy
-        dataset_id = "DICOM_Dataset"
-        dataset_name = "DICOM Collection"
-        self.dataset = DatasetNode(dataset_id, dataset_name)
-
-        for patient_id, series_dict in self.dicom_files.items():
-            # Create or get the PatientNode and add it to the DatasetNode
-            if not self.dataset.get_patient(patient_id):
-                any_series = next(iter(series_dict.values()))
-                patient_name = any_series.PatientName
-                patient_node = PatientNode(patient_id, patient_name, parent_dataset=self.dataset)
-                self.dataset.add_patient(patient_node)
-
-            if patient_id not in self.dataset.patients:
-                # Assuming that PatientName is stored in one of the SeriesNodes
-                any_series = next(iter(series_dict.values()))
-                patient_name = any_series.PatientName
-                patient_node = PatientNode(patient_id, patient_name, parent_dataset=self.dataset)
-                self.dataset.add_patient(patient_node)
-            else:
-                patient_node = self.dataset.get_patient(patient_id)
-
-            for series_uid, series_node in series_dict.items():
-                # Retrieve StudyInstanceUID and StudyDescription from SeriesNode
-                study_uid = series_node.StudyInstanceUID
-                study_description = series_node.StudyDescription
-
-                # Create or get the StudyNode and add it to the PatientNode
-                if not patient_node.get_study(study_uid):
-                    study_node = StudyNode(
-                        study_uid, study_description, parent_patient=patient_node
+                    # NEW: normalize multi-FoR field on instance (esp. RTSTRUCT)
+                    inst.FrameOfReferenceUIDs = list(
+                        getattr(inst, "FrameOfReferenceUIDs", []) or []
                     )
-                    patient_node.add_study(study_node)
-                else:
-                    study_node = patient_node.get_study(study_uid)
 
-                # Add the SeriesNode to the StudyNode
-                study_node.add_series(series_node)
+                # map FoR -> series list
+                if getattr(series, "FrameOfReferenceUID", None):
+                    frame_of_reference_uid_map.setdefault(series.FrameOfReferenceUID, []).append(
+                        series
+                    )
 
-                # Update SeriesNode attributes if necessary
-                series_node.PatientID = patient_id
-                series_node.PatientName = patient_node.PatientName
-                series_node.StudyInstanceUID = study_uid
-                series_node.StudyDescription = study_description
+        # Wire references
+        for _pid, series_dict in dicom_files.items():
+            for sid, series in series_dict.items():
+                for sop_uid, inst in series.instances.items():
+                    modality = getattr(inst, "Modality", None)
 
-                # Link SeriesNode to the parent study node
-                series_node.parent_study = study_node
+                    # A) SOPInstanceUID links (instance -> instance)
+                    for ref_sop_uid in getattr(inst, "referenced_sop_instance_uids", []):
+                        ref_inst = sop_instance_uid_map.get(ref_sop_uid)
+                        if not ref_inst:
+                            continue
+
+                        _append_unique(inst.referenced_instances, ref_inst)
+                        _append_unique(ref_inst.referencing_instances, inst)
+
+                        # promote to series-level edges
+                        src_series = inst.parent_series
+                        dst_series = getattr(ref_inst, "parent_series", None)
+                        if src_series and dst_series and src_series is not dst_series:
+                            _append_unique(src_series.referenced_series, dst_series)
+                            _append_unique(dst_series.referencing_series, src_series)
+                            _append_unique(inst.referenced_series, dst_series)
+
+                    # B) Modality-specific aggregation of series links
+                    if modality in {"RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"}:
+                        for ref_inst in inst.referenced_instances:
+                            rs = ref_inst.parent_series
+                            if rs:
+                                _append_unique(inst.referenced_series, rs)
+                                _append_unique(inst.referenced_sids, rs.SeriesInstanceUID)
+
+                    if modality == "REG":
+                        for ref_sid in getattr(inst, "referenced_sids", []):
+                            rs = series_uid_map.get(ref_sid)
+                            if rs:
+                                _append_unique(inst.referenced_series, rs)
+                        for other_sid in getattr(inst, "other_referenced_sids", []):
+                            rs = series_uid_map.get(other_sid)
+                            if rs:
+                                _append_unique(inst.other_referenced_series, rs)
+                                _append_unique(inst.referenced_series, rs)
+
+                    if modality == "SEG":
+                        for ref_sid in getattr(inst, "referenced_sids", []):
+                            rs = series_uid_map.get(ref_sid)
+                            if rs:
+                                _append_unique(inst.referenced_series, rs)
+
+                    # C) Promote instance->series to series<->series (reverse edges)
+                    for rs in list(getattr(inst, "referenced_series", [])):
+                        src_series = inst.parent_series
+                        if src_series and rs and src_series is not rs:
+                            _append_unique(src_series.referenced_series, rs)
+                            _append_unique(rs.referencing_series, src_series)
+
+                    for rs in list(getattr(inst, "other_referenced_series", [])):
+                        src_series = inst.parent_series
+                        if src_series and rs and src_series is not rs:
+                            _append_unique(src_series.referenced_series, rs)
+                            _append_unique(rs.referencing_series, src_series)
+
+                    # D) NEW: RTSTRUCT multi-FoR reconciliation on the instance
+                    if (modality or "").upper() == "RTSTRUCT":
+                        # FoRs from referenced image series present in this dataset
+                        fors_from_series = {
+                            s.FrameOfReferenceUID
+                            for s in getattr(inst, "referenced_series", [])
+                            if getattr(s, "FrameOfReferenceUID", None)
+                        }
+                        # FoRs parsed from the RTSTRUCT dataset earlier (loader populated)
+                        fors_from_ds = set(inst.FrameOfReferenceUIDs or [])
+                        # Union and store back on the instance
+                        inst.FrameOfReferenceUIDs = sorted(
+                            {str(u) for u in (fors_from_series | fors_from_ds) if u}
+                        )
+
+        # --- EFFECTIVE FrameOfReference connectivity (symmetric, series-level) ---
+
+        # Reset precomputed neighbors
+        for _pid, series_dict in dicom_files.items():
+            for _sid, s in series_dict.items():
+                s.frame_of_reference_registered = getattr(s, "frame_of_reference_registered", [])
+                s.frame_of_reference_registered[:] = []
+
+        # Build FoR -> [series] buckets directly
+        for_to_series = {}  # str -> list[SeriesNode]
+
+        for _pid, series_dict in dicom_files.items():
+            for _sid, s in series_dict.items():
+                fors = set()
+
+                # series-level FoR
+                fo = getattr(s, "FrameOfReferenceUID", None)
+                if fo:
+                    fors.add(str(fo))
+
+                # derive from instances + their referenced series
+                for inst in getattr(s, "instances", {}).values():
+                    for u in getattr(inst, "FrameOfReferenceUIDs", []) or []:
+                        if u:
+                            fors.add(str(u))
+                    for rs in getattr(inst, "referenced_series", []) or []:
+                        u = getattr(rs, "FrameOfReferenceUID", None)
+                        if u:
+                            fors.add(str(u))
+
+                # (optional) only set if the field exists on a non-slotted class
+                if hasattr(s, "EffectiveFrameOfReferenceUIDs"):
+                    try:
+                        setattr(s, "EffectiveFrameOfReferenceUIDs", sorted(fors))
+                    except Exception:
+                        pass  # ignore if slotted
+
+                # bucket this series by each FoR
+                for u in fors:
+                    for_to_series.setdefault(u, []).append(s)
+
+        # Dedup helper (by identity)
+        _seen_map = {}
+
+        def _append_unique(lst, obj):
+            if obj is None:
+                return
+            lid = id(lst)
+            seen = _seen_map.get(lid)
+            if seen is None:
+                seen = set(id(x) for x in lst)
+                _seen_map[lid] = seen
+            oid = id(obj)
+            if oid not in seen:
+                lst.append(obj)
+                seen.add(oid)
+
+        # Symmetric neighbors within each effective FoR bucket
+        for u, series_list in for_to_series.items():
+            n = len(series_list)
+            for i in range(n):
+                si = series_list[i]
+                for j in range(n):
+                    if i == j:
+                        continue
+                    _append_unique(si.frame_of_reference_registered, series_list[j])
 
     def _get_metadata(self, ds, tags_to_index, instance_node):
         """
@@ -869,7 +1070,7 @@ class DICOMLoader:
                 tag_obj = Tag(tag)
                 vr = dictionary_VR(tag_obj)
                 value = ds[tag_obj].value if tag_obj in ds else None
-                if isinstance(value, Sequence) and vr == "SQ":
+                if isinstance(value, DicomSequence) and vr == "SQ":
                     metadata[keyword_for_tag(tag) or tag] = (
                         (ds[tag_obj].to_json()) if value else None
                     )
@@ -883,24 +1084,22 @@ class DICOMLoader:
 
     def _normalize_tag(self, tag):
         """
-        Normalizes a DICOM tag to its (group, element) representation.
-
-        Parameters
-        ----------
-        tag : str or tuple
-            The tag in either keyword (e.g., "PatientID") or (group, element) notation.
-
-        Returns
-        -------
-        tuple
-            The (group, element) representation of the tag if valid, otherwise None.
+        Normalize to a (group, element) tuple of ints.
+        Accepts DICOM keyword ('PatientID') or any Tag-like input.
         """
         try:
-            tag_obj = Tag(tag_for_keyword(tag))
-            group_element = (f"{tag_obj.group:04X}", f"{tag_obj.element:04X}")
-            return group_element
+            if isinstance(tag, tuple) and len(tag) == 2:
+                # allow ('0008', '0018') or (0x0008, 0x0018) etc.
+                g = int(tag[0], 16) if isinstance(tag[0], str) else int(tag[0])
+                e = int(tag[1], 16) if isinstance(tag[1], str) else int(tag[1])
+                return (g, e)
+            # keyword
+            t = Tag(tag_for_keyword(str(tag)))
+            if t is None:
+                raise ValueError(f"Unknown keyword '{tag}'")
+            return (t.group, t.element)
         except Exception:
-            print(f"Unknown keyword '{tag}' ignored.")
+            print(f"Unknown tag/keyword '{tag}' ignored.")
             return None
 
     def _get_column_dtype(self, tag):
@@ -1101,6 +1300,178 @@ class DICOMLoader:
                 )
 
         return df_result.drop_duplicates().reset_index(drop=True)
+
+    def advanced_query(
+        self,
+        query_level: str = "INSTANCE",
+        *,
+        df_filters: Optional[Dict[str, Union[str, List[Any], Dict[str, Any]]]] = None,
+        dcm_filters: Optional[Dict[str, Union[str, List[Any], Dict[str, Any]]]] = None,
+        dcm_options: Optional[QueryOptions] = None,
+        return_instances: bool = False,  # include matching InstanceNodes
+        return_paths: bool = False,  # if True, return file paths instead of nodes
+    ):
+        """
+        Two-stage advanced query.
+
+        Stage 1 (optional): DataFrame shortlist via `query`-style filters.
+        Stage 2 (optional): Deep DICOM evaluation via pydicom:
+            - wildcards/regex (including escaped '\*', '\?')
+            - multi-value (VM>1) tags (ANY/ALL via QueryOptions)
+            - nested sequences via dot-paths with [*] or [index]
+            - date/time/datetime ranges for DA/TM/DT
+
+        Parameters
+        ----------
+        query_level : {"PATIENT","STUDY","SERIES","INSTANCE"}
+            Desired granularity for the returned DataFrame.
+        df_filters : dict, optional
+            Filters applied to self.metadata_df using your `query_df` semantics.
+        dcm_filters : dict, optional
+            Deep DICOM filters evaluated by opening the files (uses `query_instances`).
+        dcm_options : QueryOptions, optional
+            Controls deep-query behavior (e.g., any_vs_all_multi="any"/"all").
+        return_instances : bool
+            If True, also return a list of matching InstanceNodes (or paths if return_paths=True).
+        return_paths : bool
+            If True (and return_instances=True), return file paths instead of InstanceNodes.
+
+        Returns
+        -------
+        If return_instances or return_paths is True:
+            (hits: list[InstanceNode|str], df: pd.DataFrame)
+        Else:
+            df: pd.DataFrame
+        """
+        if self.metadata_df is None or self.metadata_df.empty:
+            empty = self.metadata_df.iloc[0:0] if self.metadata_df is not None else pd.DataFrame()
+            return ([], empty) if (return_instances or return_paths) else empty
+
+        levels = {
+            "PATIENT": ["PatientID"],
+            "STUDY": ["PatientID", "StudyInstanceUID"],
+            "SERIES": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID"],
+            "INSTANCE": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"],
+        }
+        ql = query_level.upper()
+        if ql not in levels:
+            raise ValueError(
+                f"Invalid query level '{query_level}'. Must be one of {list(levels.keys())}."
+            )
+
+        # ---------------- Stage 1: DataFrame shortlist ----------------
+        shortlist_df = self.metadata_df
+        if df_filters:
+            shortlist_df = self.query(query_level, **df_filters)
+
+        if dcm_filters is None:
+            # No deep stage; just project/uniq at requested level and return
+            level_cols = levels[ql]
+            # carry any df_filter columns, when present in DF
+            extra = [
+                c
+                for c in (df_filters or {}).keys()
+                if c in shortlist_df.columns and c not in level_cols
+            ]
+            out_cols = list(dict.fromkeys(level_cols + extra))
+            df_out = shortlist_df[out_cols].copy()
+            for col in df_out.columns:
+                if df_out[col].apply(lambda x: isinstance(x, list)).any():
+                    df_out[col] = df_out[col].apply(
+                        lambda x: tuple(x) if isinstance(x, list) else x
+                    )
+            df_out = df_out.drop_duplicates().reset_index(drop=True)
+
+            if return_instances or return_paths:
+                hits = []
+                if "SOPInstanceUID" in df_out.columns:
+                    for sop in df_out["SOPInstanceUID"].astype(str).tolist():
+                        inst = self._sop_to_instance.get(sop)
+                        if inst:
+                            hits.append(inst.FilePath if return_paths else inst)
+                return hits, df_out
+
+            return df_out
+
+        # ---------------- Stage 2: deep DICOM evaluation ----------------
+        # Decide which SOPs to evaluate, based on the requested level
+        if "SOPInstanceUID" in shortlist_df.columns:
+            sop_series = shortlist_df["SOPInstanceUID"]
+        elif "SeriesInstanceUID" in shortlist_df.columns:
+            sop_series = self.metadata_df[
+                self.metadata_df["SeriesInstanceUID"].isin(
+                    shortlist_df["SeriesInstanceUID"].unique()
+                )
+            ]["SOPInstanceUID"]
+        elif "StudyInstanceUID" in shortlist_df.columns:
+            sop_series = self.metadata_df[
+                self.metadata_df["StudyInstanceUID"].isin(
+                    shortlist_df["StudyInstanceUID"].unique()
+                )
+            ]["SOPInstanceUID"]
+        else:
+            sop_series = self.metadata_df[
+                self.metadata_df["PatientID"].isin(shortlist_df["PatientID"].unique())
+            ]["SOPInstanceUID"]
+
+        sop_list = sop_series.dropna().astype(str).unique().tolist()
+        if not sop_list:
+            empty = shortlist_df.iloc[0:0]
+            return ([], empty) if (return_instances or return_paths) else empty
+
+        # Build candidate list for deep evaluation
+        candidates: List[Union[str, InstanceNode]] = []
+        for sop in sop_list:
+            inst = self._sop_to_instance.get(sop)
+            if inst:
+                candidates.append(inst.FilePath if return_paths else inst)
+
+        if not candidates:
+            empty = shortlist_df.iloc[0:0]
+            return ([], empty) if (return_instances or return_paths) else empty
+
+        # Evaluate deep filters
+        dcm_options = dcm_options or QueryOptions()
+        deep_hits = query_instances(candidates, options=dcm_options, **dcm_filters)
+
+        # Map deep hits -> SOP list
+        if return_paths:
+            # Resolve path -> SOP via reverse lookup from node map
+            path_to_sop = {
+                inst.FilePath: str(inst.SOPInstanceUID) for inst in self._sop_to_instance.values()
+            }
+            hit_sops = [path_to_sop.get(p) for p in deep_hits]
+            hit_sops = [s for s in hit_sops if s]
+        else:
+            hit_sops = [str(h.SOPInstanceUID) for h in deep_hits if hasattr(h, "SOPInstanceUID")]
+
+        if not hit_sops:
+            empty = shortlist_df.iloc[0:0]
+            return (deep_hits, empty) if (return_instances or return_paths) else empty
+
+        # Build the final DF for requested level using global metadata (stable)
+        df_hits = self.metadata_df[self.metadata_df["SOPInstanceUID"].astype(str).isin(hit_sops)]
+
+        level_cols = levels[ql]
+        # Carry any referenced columns that happen to be in metadata_df;
+        # deep-only keys won’t be present
+        extra_cols = [
+            c
+            for c in (df_filters or {}).keys()
+            if c in self.metadata_df.columns and c not in level_cols
+        ]
+        out_cols = list(dict.fromkeys(level_cols + extra_cols))
+        df_out = df_hits[out_cols].copy()
+
+        for col in df_out.columns:
+            if df_out[col].apply(lambda x: isinstance(x, list)).any():
+                df_out[col] = df_out[col].apply(lambda x: tuple(x) if isinstance(x, list) else x)
+        df_out = df_out.drop_duplicates().reset_index(drop=True)
+
+        if return_instances or return_paths:
+            return deep_hits, df_out
+
+        return df_out
 
     def process_in_parallel(self, func, level="INSTANCE", num_workers=None):
         """
@@ -1801,156 +2172,542 @@ class DICOMLoader:
             return RTRecordReader(dataset)
 
     @staticmethod
+    @deprecated("get_referencing_nodes", remove_in="v0.6")
     def get_referencing_items(node, modality=None, level="INSTANCE"):
-        """
-        Retrieves all referencing items (instances or series) for a given node.
-
-        Parameters
-        ----------
-        node : InstanceNode or SeriesNode
-            The starting node for searching referencing items.
-        modality : str, optional
-            Modality to filter the referencing items (e.g., 'CT', 'MR').
-        level : str, {'INSTANCE', 'SERIES'}
-            Level at which to retrieve referencing items.
-
-        Returns
-        -------
-        list
-            A list of referencing InstanceNode or SeriesNode objects.
-        """
-        if level not in {"INSTANCE", "SERIES"}:
-            raise ValueError("level must be either 'INSTANCE' or 'SERIES'")
-
-        referencing_items = []
-
-        if isinstance(node, InstanceNode):
-            # Get instances that reference this instance
-            if level == "INSTANCE":
-                referencing_items = node.referencing_instances
-            else:  # level == "SERIES"
-                referencing_items = (
-                    node.parent_series.referencing_series if node.parent_series else []
-                )
-
-        elif isinstance(node, SeriesNode):
-            # Get referencing instances
-            referencing_instances = []
-            for inst in node.instances.values():
-                referencing_instances.extend(inst.referencing_instances)
-            referencing_instances = list(set(referencing_instances))
-            if level == "INSTANCE":
-                referencing_items = referencing_instances
-            else:  # level == "SERIES"
-                referencing_items = list(
-                    set([item.parent_series for item in referencing_instances])
-                )
-
-        else:
-            raise TypeError("Expected an InstanceNode or SeriesNode.")
-
-        # Filter by modality if specified
-        if modality:
-            referencing_items = [
-                item for item in referencing_items if getattr(item, "Modality", None) == modality
-            ]
-
-        return referencing_items
+        return DICOMLoader.get_referencing_nodes(node, modality=modality, level=level)
 
     @staticmethod
     def get_referenced_nodes(
         node: Union[SeriesNode, InstanceNode],
-        modality: Optional[str] = None,
+        modality: Optional[Union[str, Iterable[str]]] = None,
         level: str = "INSTANCE",
         recursive: bool = True,
+        include_start: bool = False,
     ) -> List[Union[SeriesNode, InstanceNode]]:
         """
-        Retrieves referenced nodes of a specified level and modality from a
-        SeriesNode or InstanceNode.
-
-        This function returns directly referenced nodes by default, and can also traverse
-        the reference graph recursively to find indirectly referenced nodes if `recursive=True`.
-
-        Parameters
-        ----------
-        node : InstanceNode or SeriesNode
-            The node to start from (e.g., RTDOSE instance, CT series).
-
-        modality : str, optional
-            If specified, filters returned nodes by Modality (e.g., "CT", "RTSTRUCT").
-            If None, all modalities are included.
-
-        level : str
-            One of {"INSTANCE", "SERIES"} (case-insensitive).
-            Determines the type of nodes to return:
-            - "INSTANCE": Returns InstanceNode objects
-            - "SERIES": Returns SeriesNode objects
-
-        recursive : bool, optional (default: True)
-            If True, traverses both direct and indirect references recursively.
-            If False, only returns directly referenced nodes.
-
-        Returns
-        -------
-        List[InstanceNode or SeriesNode]
-            A list of referenced nodes matching the given criteria.
-
-        Raises
-        ------
-        ValueError
-            If the level is not one of {"INSTANCE", "SERIES"}.
-
-        Examples
-        --------
-        >>> # Get all CT series (direct + indirect) from an RTDOSE instance
-        >>> get_referenced_nodes(rtdose_instance, modality="CT", level="series")
-
-        >>> # Get only directly referenced RTPLAN instances
-        >>> get_referenced_nodes(
-        >>>     dose_inst,
-        >>>     modality="RTPLAN",
-        >>>     level="instance",
-        >>>     recursive=False
-        >>> )
+        Return referenced nodes of a specified level (INSTANCE|SERIES), optionally filtered
+        by modality.
+        - Direct neighbors are always considered; if `recursive=False`, stop after depth=1.
+        - If `recursive=True`, traverse further (no depth limit).
+        - `include_start=False` by default (doesn't include the input `node` in results).
         """
+
+        def norm_modalities(m) -> Optional[Set[str]]:
+            if m is None:
+                return None
+            if isinstance(m, str):
+                return {m.upper()}
+            return {str(x).upper() for x in m}
+
+        def modality_ok(obj) -> bool:
+            if wanted is None:
+                return True
+            mod = getattr(obj, "Modality", None)
+            return (mod or "").upper() in wanted
+
+        def maybe_add(n):
+            if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
+                out.append(n)
+            elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
+                out.append(n)
+
         level = level.upper()
         if level not in {"INSTANCE", "SERIES"}:
             raise ValueError("level must be 'INSTANCE' or 'SERIES'")
 
-        visited = set()
-        results = []
+        wanted = norm_modalities(modality)
+        out: List[Union[SeriesNode, InstanceNode]] = []
+        seen: Set[int] = set()
 
-        def traverse(n):
-            if id(n) in visited:
+        # BFS
+        q = deque()
+        # depth=0 is the start node; we still may include it if requested
+        q.append((node, 0))
+        if include_start:
+            maybe_add(node)
+
+        max_depth = None if recursive else 1
+
+        while q:
+            n, d = q.popleft()
+            nid = id(n)
+            if nid in seen:
+                continue
+            seen.add(nid)
+
+            # collect (except the start if include_start=False)
+            if d > 0:
+                maybe_add(n)
+
+            # stop expanding if we've hit the depth limit
+            if max_depth is not None and d >= max_depth:
+                continue
+
+            # neighbors
+            if isinstance(n, SeriesNode):
+                # 1) direct series->series links (e.g., REG/SEG edges resolved at series level)
+                for s in getattr(n, "referenced_series", []) or []:
+                    q.append((s, d + 1))
+                # 2) go through instances to follow instance-level links
+                for inst in getattr(n, "instances", {}).values():
+                    # instance->instance
+                    for ref in getattr(inst, "referenced_instances", []) or []:
+                        q.append((ref, d + 1))
+                    # instance->series
+                    for s in getattr(inst, "referenced_series", []) or []:
+                        q.append((s, d + 1))
+
+            elif isinstance(n, InstanceNode):
+                # instance->instance
+                for ref in getattr(n, "referenced_instances", []) or []:
+                    q.append((ref, d + 1))
+                # instance->series
+                for s in getattr(n, "referenced_series", []) or []:
+                    q.append((s, d + 1))
+
+        # de-dup while preserving order (by id)
+        seen_ids = set()
+        deduped = []
+        for x in out:
+            xid = id(x)
+            if xid not in seen_ids:
+                seen_ids.add(xid)
+                deduped.append(x)
+
+        return deduped
+
+    @staticmethod
+    def get_referencing_nodes(
+        node: Union[SeriesNode, InstanceNode],
+        modality: Optional[Union[str, Iterable[str]]] = None,
+        level: str = "INSTANCE",
+        recursive: bool = True,
+        include_start: bool = False,
+    ) -> List[Union[SeriesNode, InstanceNode]]:
+        """
+        Return nodes that share the same FrameOfReferenceUID as the given node.
+
+        Parameters
+        ----------
+        node : SeriesNode | InstanceNode
+            Anchor node. If an InstanceNode is provided, its parent SeriesNode is used.
+        level : {'SERIES', 'INSTANCE'}, default 'SERIES'
+            - 'SERIES': return SeriesNode peers in the same Frame of Reference (FoR).
+            - 'INSTANCE': return InstanceNode peers from all series in the same FoR.
+            Note: with 'INSTANCE' and include_self=False, result can be empty if
+            there are no peer series (i.e., anchor is the only series in its FoR).
+        include_self : bool, default False
+            Include the anchor in the results:
+            - 'SERIES': include the anchor series.
+            - 'INSTANCE': include all instances from the anchor series.
+        modality : str or Iterable[str], optional
+            Case-insensitive modality filter.
+            - For level='SERIES', filters by `series.Modality` (e.g., 'CT', 'MR').
+            - For level='INSTANCE', filters by `instance.Modality` (e.g., 'CT', 'RTDOSE').
+            You may pass a single string (e.g., "CT") or an iterable (e.g., ["CT","MR"]).
+
+        Returns
+        -------
+        list[SeriesNode] | list[InstanceNode]
+            Peers in the same Frame of Reference, filtered by level/modality.
+
+        Notes
+        -----
+        - This method prefers the precomputed `series.frame_of_reference_registered`
+        filled during `_associate_dicoms`. If that list is empty, it falls back
+        to scanning `self.dicom_files`.
+        - Passing a single string for `modality` is supported and treated as a set
+        with one element (e.g., "CT" -> {"CT"}).
+
+        Examples
+        --------
+        >>> # Series peers (CT or MR) sharing the same FoR as a dose's CT
+        >>> peers = loader.get_frame_registered_nodes(dose.parent_series,
+        ...                                           level="SERIES",
+        ...                                           modality=["CT","MR"])
+        >>> # All RTDOSE instances within the same FoR (including the anchor series)
+        >>> doses = loader.get_frame_registered_nodes(ct_series,
+        ...                                           level="INSTANCE",
+        ...                                           include_self=True,
+        ...                                           modality="RTDOSE")
+        """
+
+        def norm_modalities(m) -> Optional[Set[str]]:
+            if m is None:
+                return None
+            if isinstance(m, str):
+                return {m.upper()}
+            return {str(x).upper() for x in m}
+
+        def modality_ok(obj) -> bool:
+            if wanted is None:
+                return True
+            mod = getattr(obj, "Modality", None)
+            return (mod or "").upper() in wanted
+
+        def maybe_add(n):
+            if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
+                out.append(n)
+            elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
+                out.append(n)
+
+        def enqueue(nei, depth):
+            if nei is None:
                 return
-            visited.add(id(n))
+            q.append((nei, depth))
 
-            # Yield the node if it's of the right level and matches modality
-            if level == "INSTANCE" and isinstance(n, InstanceNode):
-                if modality is None or getattr(n, "Modality", None) == modality:
-                    results.append(n)
+        level = level.upper()
+        if level not in {"INSTANCE", "SERIES"}:
+            raise ValueError("level must be 'INSTANCE' or 'SERIES'")
 
-            elif level == "SERIES" and isinstance(n, SeriesNode):
-                if modality is None or getattr(n, "Modality", None) == modality:
-                    results.append(n)
+        wanted = norm_modalities(modality)
+        out: List[Union[SeriesNode, InstanceNode]] = []
+        seen: Set[int] = set()
+        q = deque()
+        q.append((node, 0))
+        if include_start:
+            maybe_add(node)
 
-            # Traverse deeper if recursive is enabled
-            if recursive:
-                # Always follow both instance and series links regardless of output level
-                if isinstance(n, SeriesNode):
-                    for instance in n.instances.values():
-                        for ref in instance.referenced_instances:
-                            traverse(ref)
-                        for ref_series in instance.referenced_series:
-                            traverse(ref_series)
-                elif isinstance(n, InstanceNode):
-                    for ref in n.referenced_instances:
-                        traverse(ref)
-                    for ref_series in n.referenced_series:
-                        traverse(ref_series)
+        max_depth = None if recursive else 1
 
-        traverse(node)
-        return results
+        while q:
+            n, d = q.popleft()
+            nid = id(n)
+            if nid in seen:
+                continue
+            seen.add(nid)
+
+            # collect (except depth 0 unless include_start)
+            if d > 0:
+                maybe_add(n)
+
+            # stop expanding if depth cap
+            if max_depth is not None and d >= max_depth:
+                continue
+
+            # ---- incoming neighbors ----
+            if isinstance(n, InstanceNode):
+                # instances that reference this instance
+                for rin in getattr(n, "referencing_instances", []) or []:
+                    enqueue(rin, d + 1)
+                    # their parent series are also referrers at the series level
+                    enqueue(getattr(rin, "parent_series", None), d + 1)
+
+                # series that reference this instance directly (if you maintain such a list)
+                # Not standard in your model; typically we discover series via the instances above.
+
+                # the instance's parent series might be referenced by other series;
+                # climb to series and continue
+                ps = getattr(n, "parent_series", None)
+                if ps is not None:
+                    # series that reference this series (if populated)
+                    for rs in getattr(ps, "referencing_series", []) or []:
+                        enqueue(rs, d + 1)
+
+            elif isinstance(n, SeriesNode):
+                # series that reference this series (if populated)
+                for rs in getattr(n, "referencing_series", []) or []:
+                    enqueue(rs, d + 1)
+
+                # instances that reference any instance within this series
+                for inst in getattr(n, "instances", {}).values():
+                    for rin in getattr(inst, "referencing_instances", []) or []:
+                        enqueue(rin, d + 1)
+                        enqueue(getattr(rin, "parent_series", None), d + 1)
+
+        # stable de-dup by object id
+        uniq_ids = set()
+        deduped = []
+        for x in out:
+            xid = id(x)
+            if xid not in uniq_ids:
+                uniq_ids.add(xid)
+                deduped.append(x)
+
+        return deduped
+
+    @staticmethod
+    def get_frame_registered_nodes(
+        node: Union[SeriesNode, InstanceNode],
+        *,
+        level: str = "SERIES",
+        include_self: bool = False,
+        modality: Optional[Union[str, Iterable[str]]] = None,
+        dicom_files: Optional[Dict[str, Dict[str, SeriesNode]]] = None,
+        derive_frame_from_references: bool = True,
+    ) -> List[Union[SeriesNode, InstanceNode]]:
+        """
+        Return nodes that share at least one effective FrameOfReferenceUID with the anchor.
+
+        Effective FoR of a series is the union of:
+        - series.FrameOfReferenceUID
+        - (if derive_frame_from_references) any inst.FrameOfReferenceUIDs
+        - (if derive_frame_from_references) FoR of any series referenced by its instances
+        """
+
+        def _wanted_set(m):
+            if m is None:
+                return None
+            return {m.upper()} if isinstance(m, str) else {str(x).upper() for x in m}
+
+        def _series_mod_ok(s):
+            return wanted is None or (getattr(s, "Modality", None) or "").upper() in wanted
+
+        def _inst_mod_ok(i):
+            return wanted is None or (getattr(i, "Modality", None) or "").upper() in wanted
+
+        def _effective_fors(series: SeriesNode) -> set[str]:
+            fors: set[str] = set()
+            fo_direct = getattr(series, "FrameOfReferenceUID", None)
+            if fo_direct:
+                fors.add(str(fo_direct))
+            if derive_frame_from_references:
+                for inst in getattr(series, "instances", {}).values():
+                    for u in getattr(inst, "FrameOfReferenceUIDs", []) or []:
+                        if u:
+                            fors.add(str(u))
+                    for rs in getattr(inst, "referenced_series", []) or []:
+                        u = getattr(rs, "FrameOfReferenceUID", None)
+                        if u:
+                            fors.add(str(u))
+            return fors
+
+        lvl = str(level).upper()
+        if lvl not in {"SERIES", "INSTANCE"}:
+            raise ValueError("level must be 'SERIES' or 'INSTANCE'")
+
+        wanted = _wanted_set(modality)
+
+        # Anchor series + anchor FoR set
+        anchor_series = (
+            node if isinstance(node, SeriesNode) else getattr(node, "parent_series", None)
+        )
+        anchor_fors: set[str] = set()
+        if isinstance(node, InstanceNode) and getattr(node, "FrameOfReferenceUIDs", None):
+            anchor_fors |= {str(u) for u in (node.FrameOfReferenceUIDs or []) if u}
+        if anchor_series and getattr(anchor_series, "FrameOfReferenceUID", None):
+            anchor_fors.add(str(anchor_series.FrameOfReferenceUID))
+        # If still empty and we’re allowed to derive, derive from anchor series’ instances
+        if not anchor_fors and anchor_series and derive_frame_from_references:
+            anchor_fors |= _effective_fors(anchor_series)
+
+        if not anchor_fors:
+            # no FoR context — return only self if requested
+            if include_self:
+                if lvl == "SERIES" and isinstance(node, SeriesNode) and _series_mod_ok(node):
+                    return [node]
+                if lvl == "INSTANCE" and isinstance(node, InstanceNode) and _inst_mod_ok(node):
+                    return [node]
+            return []
+
+        # Collect peer series: intersection of effective FoRs with anchor_fors
+        peer_series: list[SeriesNode] = []
+        seen_sid: set[int] = set()
+
+        # Prefer dicom_files when provided (covers RTSTRUCT/SEG/REG cases correctly)
+        if dicom_files:
+            for _pid, sdict in dicom_files.items():
+                for s in sdict.values():
+                    if anchor_series is not None and s is anchor_series:
+                        continue
+                    eff = _effective_fors(s)
+                    if eff and (eff & anchor_fors):
+                        if id(s) not in seen_sid:
+                            peer_series.append(s)
+                            seen_sid.add(id(s))
+        else:
+            # Fallback to precomputed FoR neighbors (series-level only; may miss RTSTRUCT)
+            if anchor_series:
+                for s in list(getattr(anchor_series, "frame_of_reference_registered", []) or []):
+                    if id(s) in seen_sid:
+                        continue
+                    # verify intersection using effective FoRs to avoid false negatives
+                    if _effective_fors(s) & anchor_fors:
+                        peer_series.append(s)
+                        seen_sid.add(id(s))
+
+        if lvl == "SERIES":
+            out = []
+            if include_self and anchor_series and _series_mod_ok(anchor_series):
+                out.append(anchor_series)
+            out.extend([s for s in peer_series if _series_mod_ok(s)])
+            # de-dup
+            seen = set()
+            dedup = []
+            for x in out:
+                if id(x) not in seen:
+                    seen.add(id(x))
+                    dedup.append(x)
+            return dedup
+
+        # INSTANCE level: return instances from anchor (optional) + peer series
+        out_i: list[InstanceNode] = []
+
+        def add_series(series: SeriesNode):
+            for inst in getattr(series, "instances", {}).values():
+                if _inst_mod_ok(inst):
+                    out_i.append(inst)
+
+        if include_self and anchor_series:
+            add_series(anchor_series)
+        for s in peer_series:
+            add_series(s)
+
+        seen = set()
+        dedup = []
+        for x in out_i:
+            if id(x) not in seen:
+                seen.add(id(x))
+                dedup.append(x)
+        return dedup
+
+    def get_frame_registered_clusters(
+        self,
+        *,
+        scope: str = "dataset",  # 'dataset' | 'patient' | 'study'
+        patient_id: Optional[str] = None,
+        study_uid: Optional[str] = None,
+        modality: Optional[Union[str, Iterable[str]]] = None,
+        include_missing_for: bool = False,
+        derive_frame_from_references: bool = True,  # <— generic & True by default
+        min_cluster_size: int = 1,
+    ) -> Dict[str, List[SeriesNode]]:
+        """
+        Group series by FrameOfReferenceUID (FoR) within the chosen scope.
+
+        Scope
+        -----
+        - 'dataset': consider all series in `self.dicom_files` (all patients/studies).
+        - 'patient': consider only series under `patient_id`.
+        - 'study'  : consider only series under (`patient_id`, `study_uid`).
+                    Cross-study series with the same FoR are excluded by design.
+
+        Parameters
+        ----------
+        scope : {'dataset','patient','study'}, default 'dataset'
+        patient_id : str, optional
+            Required when scope is 'patient' or 'study'.
+        study_uid : str, optional
+            Required when scope is 'study'.
+        modality : str or Iterable[str], optional
+            Case-insensitive modality filter applied to `series.Modality`.
+            Accepts a single string (e.g., "CT") or an iterable (e.g., ["CT","MR"]).
+        include_missing_for : bool, default False
+            If True, include series with no resolvable FoR under key '<MISSING>'.
+        derive_frame_from_references : bool, default True
+            When True, derive additional FoR memberships for a series by inspecting:
+            (1) each instance's `InstanceNode.FrameOfReferenceUIDs`, and
+            (2) each instance's `referenced_series.FrameOfReferenceUID`.
+            The final FoR set is the union of the series' own FoR (if any) and the derived FoRs.
+            A series may therefore appear in multiple clusters (e.g., RTSTRUCT that references
+            multiple FoRs). When False, only the series' own FoR is used.
+        min_cluster_size : int, default 1
+            Drop clusters smaller than this size (by number of series).
+
+        Returns
+        -------
+        dict[str, list[SeriesNode]]
+            Map FoR UID -> list of SeriesNodes (sorted by Modality then SeriesInstanceUID).
+            If `include_missing_for` is True, includes key '<MISSING>' when no FoR is found.
+
+        Notes
+        -----
+        - With `derive_frame_from_references=True` (default), RTSTRUCT or any modality that carries
+        or references multiple FoRs can appear in multiple FoR clusters, which matches DICOM
+        allowances.
+        - With `derive_frame_from_references=False`, clustering is a strict series-level FoR
+        grouping.
+
+        Examples
+        --------
+        >>> # dataset-wide clusters (CT only)
+        >>> clusters = loader.get_frame_registered_clusters(modality="CT")
+        >>> # patient-scope clusters (CT or MR)
+        >>> clusters_p = loader.get_frame_registered_clusters(scope="patient",
+        ...                                                  patient_id="P001",
+        ...                                                  modality=["CT","MR"])
+        >>> # study-scope clusters (no cross-study FoR pulling)
+        >>> clusters_s = loader.get_frame_registered_clusters(scope="study",
+        ...                                                  patient_id="P001",
+        ...                                                  study_uid="1.2.3")
+        >>> # derive FoR from references (default True) and keep only clusters with ≥2 series
+        >>> clusters_rt = loader.get_frame_registered_clusters(scope="patient",
+        ...     patient_id="P001", min_cluster_size=2)
+        """
+
+        def _wanted_set(m: Optional[Union[str, Iterable[str]]]) -> Optional[Set[str]]:
+            if m is None:
+                return None
+            if isinstance(m, str):
+                return {m.upper()}
+            return {str(x).upper() for x in m}
+
+        def mod_ok(s: SeriesNode) -> bool:
+            return wanted is None or (getattr(s, "Modality", None) or "").upper() in wanted
+
+        wanted = _wanted_set(modality)
+
+        scope_l = scope.lower()
+        if scope_l == "dataset":
+            series_iter = (
+                s for _pid, sdict in (self.dicom_files or {}).items() for s in sdict.values()
+            )
+        elif scope_l == "patient":
+            if not patient_id:
+                raise ValueError("patient_id is required when scope='patient'")
+            series_iter = iter((self.dicom_files.get(patient_id, {}) or {}).values())
+        elif scope_l == "study":
+            if not (patient_id and study_uid):
+                raise ValueError("patient_id and study_uid are required when scope='study'")
+            series_iter = (
+                s
+                for s in (self.dicom_files.get(patient_id, {}) or {}).values()
+                if getattr(s, "StudyInstanceUID", None) == study_uid
+            )
+        else:
+            raise ValueError("scope must be one of {'dataset','patient','study'}")
+
+        groups: Dict[str, List[SeriesNode]] = defaultdict(list)
+
+        for s in series_iter:
+            if not mod_ok(s):
+                continue
+
+            # Start with the series' own FoR (if any)
+            fors: Set[str] = set()
+            fo_direct = getattr(s, "FrameOfReferenceUID", None)
+            if fo_direct:
+                fors.add(str(fo_direct))
+
+            if derive_frame_from_references:
+                # Add FoRs from instances
+                for inst in getattr(s, "instances", {}).values():
+                    # Instance-declared FoRs (multi-FoR friendly, e.g., RTSTRUCT)
+                    for u in getattr(inst, "FrameOfReferenceUIDs", []) or []:
+                        if u:
+                            fors.add(str(u))
+                    # FoRs from explicitly referenced series
+                    for rs in getattr(inst, "referenced_series", []) or []:
+                        u = getattr(rs, "FrameOfReferenceUID", None)
+                        if u:
+                            fors.add(str(u))
+
+            if fors:
+                for u in fors:
+                    groups[u].append(s)
+            else:
+                if include_missing_for:
+                    groups["<MISSING>"].append(s)
+
+        # Sort and filter by min_cluster_size
+        for k in list(groups.keys()):
+            groups[k] = sorted(
+                groups[k], key=lambda x: ((x.Modality or ""), (x.SeriesInstanceUID or ""))
+            )
+        if min_cluster_size > 1:
+            groups = {k: v for k, v in groups.items() if len(v) >= min_cluster_size}
+
+        return dict(groups)
 
     @staticmethod
     def get_nodes_for_patient(
@@ -2112,20 +2869,20 @@ class DICOMLoader:
             return modality_colors.get(modality, modality_colors["DEFAULT"])
 
         def get_referenced_series(series):
-            referenced_series = set()
+            referenced_series = list()
             for sop_uid, instance in series.instances.items():
                 if instance.referenced_series:
                     for ref_series in instance.referenced_series:
-                        referenced_series.add(ref_series)
+                        referenced_series.append(ref_series)
 
             return referenced_series
 
         def get_other_referenced_series(series):
-            referenced_series = set()
+            referenced_series = list()
             for sop_uid, instance in series.instances.items():
                 if instance.other_referenced_series:
                     for ref_series in instance.other_referenced_series:
-                        referenced_series.add(ref_series)
+                        referenced_series.append(ref_series)
 
             return referenced_series
 
@@ -2424,7 +3181,7 @@ class DICOMLoader:
                             # Check if the series references another series directly
                             referenced_series_set = get_referenced_series(series)
                             if referenced_series_set:
-                                referenced_series = referenced_series_set.pop()
+                                referenced_series = referenced_series_set[0]
                                 if not exclude_referenced(referenced_series):
                                     referenced_series_uid = referenced_series.SeriesInstanceUID
                                     referencing_nodes_set.add(series.SeriesInstanceUID)
@@ -2441,7 +3198,7 @@ class DICOMLoader:
                             if series.Modality == "REG":
                                 other_referenced_series_set = get_other_referenced_series(series)
                                 if other_referenced_series_set:
-                                    other_referenced_series = other_referenced_series_set.pop()
+                                    other_referenced_series = other_referenced_series_set[0]
                                     if not exclude_referenced(other_referenced_series):
                                         referencing_nodes_set.add(series.SeriesInstanceUID)
                                         # Draw a dashed blue edge for the REG moving image
@@ -2587,6 +3344,24 @@ class DICOMLoader:
         """
         if self.dataset:
             yield from self.dataset
+
+    def __getitem__(self, patient_id):
+        return self.dataset[patient_id]
+
+    def __contains__(self, patient_id):
+        return patient_id in self.dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def iter_studies(self):
+        self.dataset.iter_studies()
+
+    def iter_series(self):
+        self.dataset.iter_series()
+
+    def iter_instances(self):
+        self.dataset.iter_instances()
 
     def __repr__(self):
         """
