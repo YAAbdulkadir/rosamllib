@@ -6,6 +6,7 @@ import pandas as pd
 import SimpleITK as sitk
 import nibabel as nib
 import numpy as np
+import warnings
 from pathlib import Path
 from datetime import datetime
 from pydicom import dcmread
@@ -13,6 +14,7 @@ from pydicom.datadict import dictionary_VR
 from pydicom.multival import MultiValue
 from rosamllib.constants import VR_TO_DTYPE
 from ipaddress import ip_address
+from functools import wraps
 
 
 def sort_by_image_position_patient(file_names_or_datasets, reverse=False):
@@ -320,8 +322,8 @@ def get_referenced_sop_instance_uids(ds):
     from RTSTRUCT, RTPLAN, and RTDOSE DICOM files, ensuring no duplicates.
 
     This method scans the DICOM dataset for references to other DICOM instances
-    and returns a dictionary where keys are SOPClassUIDs and values are sets
-    (or lists, if converted) of unique associated SOPInstanceUIDs.
+    and returns a dictionary where keys are SOPClassUIDs and values are lists
+     of unique associated SOPInstanceUIDs.
 
     Parameters
     ----------
@@ -386,6 +388,19 @@ def get_referenced_sop_instance_uids(ds):
                     add_reference(item)
 
     return {k: list(v) for k, v in sop_class_to_instance_uids.items()}
+
+
+def extract_rtstruct_for_uids(ds) -> List[str]:
+    uids = set()
+    if hasattr(ds, "ReferencedFrameOfReferenceSequence"):
+        for it in ds.ReferencedFrameOfReferenceSequence:
+            if hasattr(it, "FrameOfReferenceUID"):
+                uids.add(str(it.FrameOfReferenceUID))
+    if hasattr(ds, "StructureSetROISequence"):
+        for it in ds.StructureSetROISequence:
+            if hasattr(it, "ReferencedFrameOfReferenceUID"):
+                uids.add(str(it.ReferencedFrameOfReferenceUID))
+    return sorted(uids)
 
 
 def validate_dicom_path(path):
@@ -761,3 +776,21 @@ def transform_image(
     transformed_image = sitk.Resample(image, image, transform, interpolator, default_value)
 
     return transformed_image
+
+
+def deprecated(replacement: str, remove_in: str = ""):
+    msg_tail = f" and will be removed in {remove_in}" if remove_in else ""
+
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            warnings.warn(
+                f"{fn.__qualname__} is deprecated{msg_tail}; use {replacement} instead.",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return deco
