@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, Optional, Any
+from typing import Dict, Iterator, List, Optional, Any
 import re
 
 _UID_RE = re.compile(r"^\d+(?:\.\d+)*$")
@@ -634,66 +634,61 @@ class InstanceNode:
     FilePath : str
         The file path to the DICOM file.
     modality : str, optional
-        The modality of the instance (e.g., 'CT', 'MR'). Default is None.
+        The modality of the instance (e.g., 'CT', 'MR', 'RTSTRUCT'). Default is None.
     parent_series : SeriesNode, optional
         The `SeriesNode` this instance belongs to. Default is None.
 
     Attributes
     ----------
     SOPInstanceUID : str
-        The unique identifier for the DICOM instance.
     FilePath : str
-        The file path to the DICOM file.
     Modality : str or None
-        The modality of the instance.
-    references : list
-        A list of references from this instance to other instances or series.
-    referenced_sop_instance_uids : list of str
-        List of SOPInstanceUIDs referenced by this instance.
-    referenced_sids : list of str
-        List of SeriesInstanceUIDs referenced by this instance.
-    referenced_series : list of SeriesNode
-        A list of `SeriesNode` objects referenced by this instance.
-    other_referenced_sids : list of str
-        A list of additional SeriesInstanceUIDs referenced by this instance,
-        for cases with multiple references (e.g., moving image in registration).
-    other_referenced_series : list of SeriesNode
-        A list of additional `SeriesNode` objects referenced by this instance.
-    referenced_instances : list of InstanceNode
-        List of `InstanceNode` objects referenced by this instance.
-    referencing_instances : list of InstanceNode
-        List of `InstanceNode` objects that reference this instance.
+    FrameOfReferenceUIDs : list[str]
+        Zero or more FrameOfReference UIDs associated with this instance.
+        - For typical image instances (CT/MR/PT), this is usually empty; FoR is on the Series.
+        - For RTSTRUCT, this may contain one or more UIDs collected from:
+          * ReferencedFrameOfReferenceSequence[*].FrameOfReferenceUID
+          * StructureSetROISequence[*].ReferencedFrameOfReferenceUID
+          * Plus the FoRs of any referenced image Series
+          (sanity union performed during association).
+    references : list[Any]
+    referenced_sop_instance_uids : list[str]
+    referenced_sids : list[str]
+    referenced_series : list[SeriesNode]
+    other_referenced_sids : list[str]
+    other_referenced_series : list[SeriesNode]
+    referenced_instances : list[InstanceNode]
+    referencing_instances : list[InstanceNode]
     parent_series : SeriesNode or None
-        The `SeriesNode` that this instance belongs to.
-
-    Examples
-    --------
-    >>> instance = InstanceNode("1.2.3.4.5.6.7", "/path/to/file.dcm", modality="CT")
-    >>> instance.SOPInstanceUID
-    '1.2.3.4.5.6.7'
-    >>> instance.Modality
-    'CT'
-    >>> instance.FilePath
-    '/path/to/file.dcm'
     """
 
     SOPInstanceUID: str
     FilePath: str
     Modality: Optional[str] = None
-    parent_series: Optional[SeriesNode] = None
+    parent_series: Optional["SeriesNode"] = None  # quote if no __future__ annotations
+
+    # RTSTRUCT (and any future multi-FoR cases)
+    FrameOfReferenceUIDs: List[str] = field(default_factory=list)
 
     # references & relations
-    references: list[Any] = field(default_factory=list)
-    referenced_sop_instance_uids: list[str] = field(default_factory=list)
-    referenced_sids: list[str] = field(default_factory=list)
-    referenced_series: list[SeriesNode] = field(default_factory=list)
-    other_referenced_sids: list[str] = field(default_factory=list)
-    other_referenced_series: list[SeriesNode] = field(default_factory=list)
-    referenced_instances: list[InstanceNode] = field(default_factory=list)
-    referencing_instances: list[InstanceNode] = field(default_factory=list)
+    references: List[Any] = field(default_factory=list)
+    referenced_sop_instance_uids: List[str] = field(default_factory=list)
+    referenced_sids: List[str] = field(default_factory=list)
+    referenced_series: List["SeriesNode"] = field(default_factory=list)
+    other_referenced_sids: List[str] = field(default_factory=list)
+    other_referenced_series: List["SeriesNode"] = field(default_factory=list)
+    referenced_instances: List["InstanceNode"] = field(default_factory=list)
+    referencing_instances: List["InstanceNode"] = field(default_factory=list)
 
+    # --- visitors ---
     def accept(self, visitor):
         return visitor.visit_instance(self)
+
+    # --- convenience ---
+    @property
+    def primary_for_uid(self) -> Optional[str]:
+        """Return a representative FrameOfReferenceUID if present (first in list)."""
+        return self.FrameOfReferenceUIDs[0] if self.FrameOfReferenceUIDs else None
 
     def __getattr__(self, name: str) -> Any:
         if self.parent_series is not None:
@@ -712,6 +707,7 @@ class InstanceNode:
             "SOPInstanceUID": self.SOPInstanceUID,
             "FilePath": self.FilePath,
             "Modality": self.Modality,
+            "FrameOfReferenceUIDs": list(self.FrameOfReferenceUIDs),
             "referenced_sop_instance_uids": list(self.referenced_sop_instance_uids),
             "referenced_sids": list(self.referenced_sids),
             "other_referenced_sids": list(self.other_referenced_sids),
@@ -719,14 +715,15 @@ class InstanceNode:
 
     @classmethod
     def from_dict(
-        cls, d: dict[str, Any], parent_series: Optional[SeriesNode] = None
-    ) -> InstanceNode:
+        cls, d: dict[str, Any], parent_series: Optional["SeriesNode"] = None
+    ) -> "InstanceNode":
         inst = cls(
             SOPInstanceUID=d["SOPInstanceUID"],
             FilePath=d["FilePath"],
             Modality=d.get("Modality"),
             parent_series=parent_series,
         )
+        inst.FrameOfReferenceUIDs = list(d.get("FrameOfReferenceUIDs", []))
         inst.referenced_sop_instance_uids = list(d.get("referenced_sop_instance_uids", []))
         inst.referenced_sids = list(d.get("referenced_sids", []))
         inst.other_referenced_sids = list(d.get("other_referenced_sids", []))
