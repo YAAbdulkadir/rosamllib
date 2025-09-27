@@ -227,25 +227,6 @@ def _to_tag(obj) -> Optional[Tag]:
         return None
 
 
-# def _as_specific_key(tag_like: Any) -> str:
-#     """
-#     Return a string acceptable by pydicom 'specific_tags':
-#     - DICOM keyword ('PatientID') if resolvable
-#     - otherwise canonical 'GGGG,EEEE' uppercase hex
-#     """
-#     t, _vr, key = _tag_info(str(tag_like))
-#     if t is not None:
-#         # keyword path; keep the keyword (key) pydicom accepts
-#         return key
-#     # If keyword lookup failed, try to normalize "GGGG,EEEE" to uppercase
-#     try:
-#         g, e = key.split(",")
-#         return f"{int(g,16):04X},{int(e,16):04X}"
-#     except Exception:
-#         # Last resort: return original; pydicom will ignore unknowns
-#         return key
-
-
 def _as_specific_key(tag_like: Any) -> str:
     t = _to_tag(tag_like)
     if t is not None:
@@ -2871,18 +2852,22 @@ class DICOMLoader:
         def get_referenced_series(series):
             referenced_series = list()
             for sop_uid, instance in series.instances.items():
-                if instance.referenced_series:
-                    for ref_series in instance.referenced_series:
-                        referenced_series.append(ref_series)
+                if instance.referenced_sids:
+                    for ref_sid in instance.referenced_sids:
+                        ref_series = self.get_series(ref_sid)
+                        if ref_series:
+                            referenced_series.append(ref_series)
 
             return referenced_series
 
         def get_other_referenced_series(series):
             referenced_series = list()
             for sop_uid, instance in series.instances.items():
-                if instance.other_referenced_series:
-                    for ref_series in instance.other_referenced_series:
-                        referenced_series.append(ref_series)
+                if instance.other_referenced_sids:
+                    for ref_sid in instance.other_referenced_sids:
+                        ref_series = self.get_series(ref_sid)
+                        if ref_series:
+                            referenced_series.append(ref_series)
 
             return referenced_series
 
