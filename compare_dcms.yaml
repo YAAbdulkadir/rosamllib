@@ -1,0 +1,24 @@
+ignore_private: true
+ignore_bulk: true
+numeric_tol: 1e-6
+case_insensitive_strings: false
+
+ignore:
+  - "PatientName"
+  - "(0012,0062)"
+
+sequence_keys:
+  # Generic imaging
+  "RequestAttributesSequence": ["RequestedProcedureID"]
+  "(0040,0275)": ["RequestedProcedureID"]  # tag-hex form
+
+  # RT common
+  "StructureSetROISequence": ["ROINumber"]
+  "ROIContourSequence": ["ReferencedROINumber"]
+  "BeamSequence": ["BeamNumber"]
+  "(300a,00b0)": ["BeamNumber"]
+  "ReferencedFrameOfReferenceSequence": ["FrameOfReferenceUID"]
+
+sequence_fallback: "order"   # or "report"
+collect_all_matches: true
+max_ok_rows: 200000
