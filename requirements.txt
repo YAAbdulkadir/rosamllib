@@ -8,6 +8,7 @@ pandas
 plotly
 pydicom
 pynetdicom
+pyyaml
 rt-utils==1.2.7
 scikit-image
 scipy
