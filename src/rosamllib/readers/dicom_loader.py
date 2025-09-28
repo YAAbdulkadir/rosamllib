@@ -13,8 +13,8 @@ from collections import defaultdict, deque
 from itertools import chain
 from pydicom import dcmread
 from pydicom.tag import Tag, BaseTag
-from pydicom.sequence import Sequence as DicomSequence
 from pydicom.datadict import keyword_for_tag, tag_for_keyword, dictionary_VR
+from dataclasses import dataclass
 from rosamllib.readers import (
     DICOMImageReader,
     RTStructReader,
@@ -99,6 +99,7 @@ def _tag_info(col: str):
 
 # Core, always-needed keywords
 CORE_TAGS = [
+    "SOPClassUID",
     "SOPInstanceUID",
     "SeriesInstanceUID",
     "StudyInstanceUID",
@@ -135,6 +136,15 @@ SEG_SEQ = [
     "ReferencedSeriesSequence",
     "ReferencedInstanceSequence",
 ]
+
+
+@dataclass(frozen=True)
+class TagPlan:
+    tag: Tag
+    name: str
+    vr: str
+    is_sq: bool
+    # parser: Any
 
 
 def _parse_int_flex(x) -> int:
@@ -246,13 +256,21 @@ def _build_specific_tags_set(user_tags: Optional[Iterable[Any]]) -> set:
         t = _to_tag(k)
         if t is not None:
             wanted.add(t)
-    # user-specified
+    # user-specified (can be Tag, TagPlan, keyword, etc.)
     if user_tags:
         for u in user_tags:
-            t = _to_tag(u)
+            t = getattr(u, "tag", None)  # TagPlan?
+            if t is None:
+                t = _to_tag(u)
             if t is not None:
                 wanted.add(t)
     return wanted
+
+
+def _specific_from_tag_plan(tag_plan: Optional[list[TagPlan]]) -> set[Tag]:
+    if not tag_plan:
+        return set()
+    return {tp.tag for tp in tag_plan}
 
 
 def _extend_for_modalities(
@@ -327,8 +345,36 @@ def _choose_executor(num_tasks: int, *, prefer: str = "auto", threshold: int = 3
         return ThreadPoolExecutor, _max_workers_io(), False
 
 
-def get_metadata(ds, tags_to_index):
-    metadata = {
+def build_tag_plan(tags_to_index: list[tuple[int, int]]) -> list[TagPlan]:
+    plan = []
+    all_tags = []
+
+    for k in CORE_TAGS:
+        t = tag_for_keyword(k)
+        if t:
+            all_tags.append((Tag(t).group, Tag(t).element))
+    if tags_to_index:
+        for g, e in tags_to_index:
+            all_tags.append((g, e))
+
+    seen = set()
+    uniq = []
+    for ge in all_tags:
+        if ge not in seen:
+            seen.add(ge)
+            uniq.append(ge)
+
+    for g, e in uniq:
+        t = Tag((g, e))
+        vr = dictionary_VR(t)
+        name = keyword_for_tag(t) or f"{g:04X},{e:04X}"
+        is_sq = vr == "SQ"
+        plan.append(TagPlan(tag=t, name=name, vr=vr, is_sq=is_sq))
+    return plan
+
+
+def get_metadata(ds, plan: list[TagPlan], seq_policy: str = "json") -> Dict[str, Any]:
+    out = {
         "SOPInstanceUID": getattr(ds, "SOPInstanceUID", None),
         "SeriesInstanceUID": getattr(ds, "SeriesInstanceUID", None),
         "Modality": getattr(ds, "Modality", None),
@@ -339,28 +385,40 @@ def get_metadata(ds, tags_to_index):
         "PatientID": getattr(ds, "PatientID", None),
         "PatientName": getattr(ds, "PatientName", None),
     }
-
-    if tags_to_index is not None:
-        for tag in tags_to_index:
-            try:
-                tag_obj = Tag(tag)
-                vr = dictionary_VR(tag_obj)
-                value = ds[tag_obj].value if tag_obj in ds else None
-                if isinstance(value, DicomSequence) and vr == "SQ":
-                    metadata[keyword_for_tag(tag) or tag] = (
-                        (ds[tag_obj].to_json()) if value else None
-                    )
+    for tp in plan:
+        try:
+            if tp.tag in ds:
+                val = ds[tp.tag].value
+                if tp.is_sq:
+                    if seq_policy == "drop":
+                        continue
+                    elif seq_policy == "len":
+                        out[tp.name] = len(val) if val is not None else 0
+                    else:
+                        out[tp.name] = ds[tp.tag].to_json() if val else None
                 else:
-                    metadata[keyword_for_tag(tag) or tag] = parse_vr_value(vr, value)
-            except Exception:
-                metadata[tag] = None
+                    if tp.vr == "UI":
+                        out[tp.name] = str(val) if val is not None else None
+                    else:
+                        out[tp.name] = parse_vr_value(tp.vr, val)
+            else:
+                if tp.is_sq:
+                    if seq_policy == "drop":
+                        continue
+                    elif seq_policy == "len":
+                        out[tp.name] = 0
+                    else:
+                        out[tp.name] = None
+                else:
+                    out[tp.name] = None
+        except Exception:
+            out[tp.name] = None
+    return out
 
-    return metadata
 
-
-def process_standard_dicom(ds, filepath, tags_to_index):
+def process_standard_dicom(ds, filepath, tag_plan, seq_policy):
     modality = getattr(ds, "Modality", None)
-    metadata = get_metadata(ds, tags_to_index)
+    metadata = get_metadata(ds, tag_plan, seq_policy)
     instance_dict = {"FilePath": filepath, **metadata}
 
     if modality in ["RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
@@ -372,9 +430,9 @@ def process_standard_dicom(ds, filepath, tags_to_index):
     return instance_dict
 
 
-def process_reg_file(filepath, tags_to_index):
+def process_reg_file(filepath, tag_plan, seq_policy):
     reg = REGReader(filepath).read()
-    metadata = get_metadata(reg, tags_to_index)
+    metadata = get_metadata(reg, tag_plan, seq_policy)
     instance_dict = {
         "FilePath": filepath,
         "ReferencedSeriesUIDs": reg.get_fixed_image_info()["SeriesInstanceUID"],
@@ -385,11 +443,11 @@ def process_reg_file(filepath, tags_to_index):
     return instance_dict
 
 
-def process_raw_file(filepath, tags_to_index):
+def process_raw_file(filepath, tag_plan, seq_policy):
     raw_reader = DICOMRawReader(filepath)
     raw_reader.read()
     ds = raw_reader.dataset
-    metadata = get_metadata(ds, tags_to_index)
+    metadata = get_metadata(ds, tag_plan, seq_policy)
     instance_dict = {
         "FilePath": filepath,
         **metadata,
@@ -399,7 +457,7 @@ def process_raw_file(filepath, tags_to_index):
         embedded_datasets = raw_reader.get_embedded_datasets()
 
         for embedded_ds in embedded_datasets:
-            embedded_metadata = get_metadata(embedded_ds, tags_to_index)
+            embedded_metadata = get_metadata(embedded_ds, tag_plan, seq_policy)
             embedded_instance_dict = {
                 **embedded_metadata,
                 "FilePath": filepath,
@@ -427,9 +485,9 @@ def process_raw_file(filepath, tags_to_index):
     return instance_dict, embedded_instances
 
 
-def process_seg_file(filepath, tags_to_index):
+def process_seg_file(filepath, tag_plan, seq_policy):
     seg = SEGReader(filepath).read()
-    metadata = get_metadata(seg, tags_to_index)
+    metadata = get_metadata(seg, tag_plan, seq_policy)
     instance_dict = {"FilePath": filepath, **metadata}
     if hasattr(seg, "ReferencedSeriesSequence"):
         ref_seq = seg.ReferencedSeriesSequence[0]
@@ -441,9 +499,10 @@ def process_seg_file(filepath, tags_to_index):
     return instance_dict
 
 
-def process_file(filepath, tags_to_index):
+def process_file(filepath, tag_plan, seq_policy):
     try:
-        specific = _build_specific_tags_set(tags_to_index)
+        # specific = _build_specific_tags_set(tag_plan)
+        specific = _specific_from_tag_plan(tag_plan)
         ds = dcmread(filepath, stop_before_pixels=True, specific_tags=specific)
 
         modality = getattr(ds, "Modality", None)
@@ -454,13 +513,13 @@ def process_file(filepath, tags_to_index):
             ds = dcmread(filepath, stop_before_pixels=True)
 
         if modality in ["CT", "MR", "PT", "RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"]:
-            instance_dict = process_standard_dicom(ds, filepath, tags_to_index)
+            instance_dict = process_standard_dicom(ds, filepath, tag_plan, seq_policy)
         elif modality == "REG":
-            instance_dict = process_reg_file(filepath, tags_to_index)
+            instance_dict = process_reg_file(filepath, tag_plan, seq_policy)
         elif modality == "RAW":
-            instance_dict, embedded_instances = process_raw_file(filepath, tags_to_index)
+            instance_dict, embedded_instances = process_raw_file(filepath, tag_plan, seq_policy)
         elif modality == "SEG":
-            instance_dict = process_seg_file(filepath, tags_to_index)
+            instance_dict = process_seg_file(filepath, tag_plan, seq_policy)
         else:
             return []
 
@@ -571,7 +630,7 @@ class DICOMLoader:
         self.dataset = DatasetNode(dataset_id, dataset_name)
         self._sop_to_instance = {}  # fast lookup: SOPInstanceUID -> InstanceNode
 
-    def load(self, tags_to_index=None):
+    def load(self, tags_to_index=None, seq_policy="len"):
         """
         Loads the DICOM files from the specified path.
 
@@ -611,18 +670,18 @@ class DICOMLoader:
             tags_to_index = list(default_tags)
 
         validate_dicom_path(self.path)
+        tag_plan = build_tag_plan(tags_to_index)
         try:
             if os.path.isdir(self.path):
-                self.load_from_directory(self.path, tags_to_index)
+                self.load_from_directory(self.path, seq_policy=seq_policy, tag_plan=tag_plan)
             else:
-                self.load_file(self.path, tags_to_index)
-            # self._build_hierarchical_structure()
+                self.load_file(self.path, seq_policy=seq_policy, tag_plan=tag_plan)
 
         except Exception as e:
             print(f"Error loading DICOM files: {e}")
             print(traceback.format_exc())
 
-    def load_from_directory(self, path, tags_to_index=None):
+    def load_from_directory(self, path, seq_policy, tag_plan=None):
         """
         Loads all DICOM files from a directory, including subdirectories.
 
@@ -633,7 +692,7 @@ class DICOMLoader:
         ----------
         path : str
             The directory path to load DICOM files from.
-        tags_to_index : list of str, optional
+        tag_plan : list of str, optional
             A list of DICOM tags (keywords) to index during loading.
 
         Returns
@@ -657,9 +716,9 @@ class DICOMLoader:
             for file in files:
                 all_files.append(os.path.join(root, file))
         print(f"Found {len(all_files)} files.")
-        self._load_files(all_files, tags_to_index)
+        self._load_files(all_files, tag_plan=tag_plan, seq_policy=seq_policy)
 
-    def load_file(self, path, tags_to_index=None):
+    def load_file(self, path, seq_policy, tag_plan=None):
         """
         Loads a single DICOM file and returns the Series object it belongs to.
 
@@ -685,10 +744,10 @@ class DICOMLoader:
         >>> dicom_file = DICOMLoader.load_file("/path/to/file.dcm")
         """
         validate_dicom_path(path)
-        self._load_files([path], tags_to_index)
+        self._load_files([path], seq_policy=seq_policy, tag_plan=tag_plan)
 
-    def _load_files(self, files, tags_to_index=None):
-        process_file_with_tags = partial(process_file, tags_to_index=tags_to_index)
+    def _load_files(self, files, seq_policy, tag_plan=None):
+        process_file_with_tags = partial(process_file, tag_plan=tag_plan, seq_policy=seq_policy)
 
         unresolved_raw_links = []
         metadata_rows = []
@@ -1027,42 +1086,6 @@ class DICOMLoader:
                         continue
                     _append_unique(si.frame_of_reference_registered, series_list[j])
 
-    def _get_metadata(self, ds, tags_to_index, instance_node):
-        """
-        Extract metadata from the DICOM dataset for specified tags.
-
-        Parameters
-        ----------
-        ds : pydicom.Dataset
-            The DICOM dataset.
-        tags_to_index : list
-            List of DICOM tags to extract.
-        instance_node : InstanceNode
-            The associated instance node.
-
-        Returns
-        -------
-        dict
-            Metadata dictionary with normalized values.
-        """
-        metadata = {"InstanceNode": instance_node}
-        for tag in tags_to_index:
-            try:
-                tag_obj = Tag(tag)
-                vr = dictionary_VR(tag_obj)
-                value = ds[tag_obj].value if tag_obj in ds else None
-                if isinstance(value, DicomSequence) and vr == "SQ":
-                    metadata[keyword_for_tag(tag) or tag] = (
-                        (ds[tag_obj].to_json()) if value else None
-                    )
-                else:
-                    metadata[keyword_for_tag(tag) or tag] = parse_vr_value(vr, value)
-            except Exception as e:
-                print(f"Exception occured:+: {e}")
-                metadata[tag] = None
-
-        return metadata
-
     def _normalize_tag(self, tag):
         """
         Normalize to a (group, element) tuple of ints.
@@ -1128,159 +1151,124 @@ class DICOMLoader:
         self.metadata_df = None
         self.load(tags_to_index)
 
-    def query(self, query_level="INSTANCE", **filters):
+    def query(
+        self,
+        query_level: str = "INSTANCE",
+        *,
+        include: Optional[Iterable[str]] = None,
+        case_insensitive: bool = False,
+        default_atol: float = 1e-6,
+        default_rtol: float = 1e-6,
+        sort_by: Optional[Iterable[str]] = None,
+        **filters,
+    ) -> pd.DataFrame:
         """
-        Queries the metadata DataFrame based on specified filters and query level,
-        supporting advanced matching including wildcards, ranges, lists, regular expressions,
-        and inverse regular expressions.
+        Query the loaded DICOM metadata at a chosen hierarchy level.
+
+        This is a convenience wrapper around :func:`query_df` that returns only the
+        identifiers relevant to the requested level (plus any columns referenced in
+        filters). All matching semantics (wildcards, regex, ranges, temporal ops,
+        container membership, callable predicates, dot-path traversal, etc.) are
+        delegated to ``query_df``.
 
         Parameters
         ----------
-        query_level : str, optional
-            The hierarchical level to query within the DICOM metadata.
-            One of {"PATIENT", "STUDY", "SERIES", "INSTANCE"}:
-            - "PATIENT": Returns unique patient-level metadata.
-            - "STUDY": Returns unique study-level metadata for each patient.
-            - "SERIES": Returns unique series-level metadata for each study.
-            - "INSTANCE": Returns individual instance-level metadata.
-            Defaults to "INSTANCE".
+        query_level : {'PATIENT', 'STUDY', 'SERIES', 'INSTANCE'}, default 'INSTANCE'
+            The granularity of the result:
+            * ``'PATIENT'``  → columns: ``['PatientID']``
+            * ``'STUDY'``    → columns: ``['PatientID', 'StudyInstanceUID']``
+            * ``'SERIES'``   → columns: ``['PatientID', 'StudyInstanceUID', 'SeriesInstanceUID']``
+            * ``'INSTANCE'`` → columns: ``['PatientID', 'StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID']``
 
-        filters : dict
-            Key-value pairs representing the query conditions. Each key is a column name
-            (corresponding to a DICOM attribute), and its value is a condition.
-            Supports the following types of filters:
-            - **Exact Match**: {"column": "value"}
-            Matches rows where the column equals the given value.
-            - **Wildcard Matching**: {"column": "value*"} or {"column": "val?e"}
-            Uses `*` to match multiple characters, `?` to match a single character.
-            Escaped wildcards can be matched with `\*` or `\?`.
-            - **Ranges**: {"column": {"gte": min_value, "lte": max_value}}
-            Supports range operators:
-            - `gte`: Greater than or equal to
-            - `lte`: Less than or equal to
-            - `gt`: Greater than
-            - `lt`: Less than
-            - `eq`: Equal to (alias for exact match)
-            - `neq`: Not equal to
-            - **Lists**: {"column": ["value1", "value2", "value3"]}
-            Matches rows where the column value is in the provided list.
-            - **Regular Expressions**: {"column": {"RegEx": "pattern"}}
-            Matches rows where the column value matches the given regular expression.
-            - **Inverse Regular Expressions**: {"column": {"NotRegEx": "pattern"}}
-            Matches rows where the column value does not match the given regular expression.
+            Any columns used in ``filters`` that exist in the metadata are also included.
+        **filters :
+            Passed through to :func:`query_df` and applied to ``self.metadata_df``.
+            See ``query_df`` for the full specification of supported operators and
+            behaviors (case insensitivity, temporal coercion, dot-paths, etc.).
 
         Returns
         -------
-        pd.DataFrame
-            A filtered DataFrame containing the matching results, restricted to the columns
-            relevant for the specified query level, along with any filter-referenced columns.
+        pandas.DataFrame
+            A de-duplicated DataFrame restricted to the identifier columns for the
+            requested level plus any filter-referenced columns. Row order follows the
+            underlying filtered metadata.
+
+        Raises
+        ------
+        ValueError
+            If ``query_level`` is not one of the supported values.
+        KeyError
+            If a filter references a column that does not exist in the metadata.
 
         Notes
         -----
-        - Wildcard filtering supports both `*` (matches zero or more characters) and `?`
-        (matches exactly one character). For literal `*` or `?`, escape them with a backslash.
-        - Range filters can be combined with wildcards, e.g., {"column": {"neq": "value*"}}.
-        - Regular expressions provide precise pattern matching using RegEx syntax.
-        - The output DataFrame includes columns specific to the query level:
-            - "PATIENT": ["PatientID"]
-            - "STUDY": ["PatientID", "StudyInstanceUID"]
-            - "SERIES": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID"]
-            - "INSTANCE": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"]
-        Additional columns used in filters are also included in the result.
+        This method relies on ``self.metadata_df`` that is populated by ``load()``.
+        For complex sequence/JSON columns, consider pre-extracting fields into their
+        own columns if you will query them frequently.
 
         Examples
         --------
-        # Example 1: Query for all series with a specific modality
+        Series by modality
         >>> loader.query(query_level="SERIES", Modality="CT")
-        PatientID  StudyInstanceUID  SeriesInstanceUID
-        0       123        A001               S001
-        1       456        A002               S002
 
-        # Example 2: Wildcard and exact match query
-        >>> loader.query(query_level="PATIENT", PatientID="1*")
-        PatientID
-        0       123
-        1       101
+        Patients with ID starting 'P1' (wildcard)
+        >>> loader.query(query_level="PATIENT", PatientID="P1*")
 
-        # Example 3: Query with a date range filter
-        >>> loader.query(query_level="STUDY", StudyDate={"gte": "2023-01-01", "lte": "2023-06-30"})
-        PatientID  StudyInstanceUID
-        0       123        A001
-        1       789        A003
+        Studies in a date range
+        >>> loader.query(query_level="STUDY", StudyDate={"gte": "2024-01-01", "lte": "2024-06-30"})
 
-        # Example 4: Combine range, wildcard, and list filters
-        >>> loader.query(
-        ...     query_level="INSTANCE",
-        ...     Modality=["CT", "MR"],
-        ...     StudyDate={"gte": "2023-01-01", "lte": "2023-12-31"},
-        ...     SOPInstanceUID="I*"
-        ... )
-        PatientID  StudyInstanceUID  SeriesInstanceUID  SOPInstanceUID
-        0       123        A001               S001             I001
-        1       456        A002               S002             I002
-
-        # Example 5: Escape literal wildcards
-        >>> loader.query(query_level="PATIENT", PatientID="123\\*")
-        PatientID
-        0    123*
-
-        # Example 5: RegEx query
-        >>> loader.query(query_level="PATIENT", PatientID={"RegEx": "^1\\d{2}$"})
-        PatientID
-        0       123
-        1       101
-
-        # Example 6: Inverse RegEx query
-        >>> loader.query(query_level="INSTANCE", SOPInstanceUID={"NotRegEx": "I\\d{3}"})
-        PatientID  StudyInstanceUID  SeriesInstanceUID  SOPInstanceUID
-        0       123        A001               S001          X001
-
-        # Example 7: Combine RegEx with range filters
-        >>> loader.query(
-        ...     query_level="STUDY",
-        ...     StudyDate={"gte": "2023-01-01", "lte": "2023-12-31"},
-        ...     StudyInstanceUID={"RegEx": "^A.*"}
-        ... )
-        PatientID  StudyInstanceUID
-        0       123        A001
-        1       789        A003
-
-        See Also
-        --------
-        query_df : Provides the underlying filtering functionality for DataFrames.
+        Instances with SOPInstanceUID matching a pattern (regex)
+        >>> loader.query(query_level="INSTANCE",
+        ...              SOPInstanceUID={"RegEx": r"^1\\.2\\.840\\..*"})
         """
-
-        levels = {
+        LEVEL_COLS = {
             "PATIENT": ["PatientID"],
             "STUDY": ["PatientID", "StudyInstanceUID"],
             "SERIES": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID"],
             "INSTANCE": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"],
         }
 
-        query_level = query_level.upper()
-        if query_level not in levels:
+        lvl = str(query_level).upper()
+        if lvl not in LEVEL_COLS:
             raise ValueError(
-                f"Invalid query level '{query_level}'. Must be one of {list(levels.keys())}."
+                f"Invalid query_level '{query_level}'. Must be one of {list(LEVEL_COLS)}."
             )
 
-        # Validate and filter metadata using query_df
-        filtered_df = query_df(self.metadata_df, **filters)
+        # 1) Filter with the generic engine
+        fdf = query_df(
+            self.metadata_df,
+            case_insensitive=case_insensitive,
+            default_atol=default_atol,
+            default_rtol=default_rtol,
+            **filters,
+        )
 
-        # Retain only relevant columns for the specified query level
-        relevant_columns = levels[query_level]
-        filter_columns = [col for col in filters.keys() if col in filtered_df.columns]
-        result_columns = list(set(relevant_columns + filter_columns))
+        # 2) Build the column set to return
+        level_cols = LEVEL_COLS[lvl]
+        # include any filter-referenced columns that actually exist
+        filter_cols = [c for c in filters.keys() if c in fdf.columns]
+        extra_cols = [c for c in (include or []) if c in fdf.columns]
 
-        df_result = filtered_df[result_columns].copy()
+        # preserve order: level IDs first, then filter cols, then extras (dedup by dict keys)
+        ordered = list(dict.fromkeys(list(level_cols) + filter_cols + extra_cols))
 
-        # Convert unhashable types to hashable ones for deduplication
-        for col in df_result.columns:
-            if df_result[col].apply(lambda x: isinstance(x, list)).any():
-                df_result[col] = df_result[col].apply(
-                    lambda x: tuple(x) if isinstance(x, list) else x
-                )
+        # 3) Sort and de-duplicate by the level ID columns
+        sort_keys = list(sort_by) if sort_by else level_cols
+        # (Only keep columns that exist to avoid KeyErrors if user passed unknown sort columns)
+        sort_keys = [c for c in sort_keys if c in fdf.columns]
+        if sort_keys:
+            fdf = fdf.sort_values(sort_keys, kind="mergesort")  # stable
 
-        return df_result.drop_duplicates().reset_index(drop=True)
+        if lvl == "INSTANCE":
+            # At instance level we can keep every row (already unique if SOPInstanceUID is unique)
+            out = fdf[ordered].copy()
+        else:
+            # Dedup ONLY on the level ID columns, keep the first row per group
+            out = fdf.drop_duplicates(subset=level_cols, keep="first")[ordered].copy()
+
+        # 4) Final tidy-up
+        out = out.reset_index(drop=True)
+        return out
 
     def advanced_query(
         self,
