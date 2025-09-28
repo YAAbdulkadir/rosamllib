@@ -723,6 +723,8 @@ def _build_tree(diffs: List["Diff"]) -> _TreeNode:
 def load_yaml_config(path: str, base_opts: DiffOptions | None = None) -> DiffOptions:
     """
     Load YAML config into DiffOptions. Requires PyYAML.
+    - Handles empty YAML (safe_load -> None) by treating it as {}.
+    - Ensures base_opts is initialized before reading defaults from it.
     """
     try:
         import yaml  # type: ignore
@@ -731,21 +733,21 @@ def load_yaml_config(path: str, base_opts: DiffOptions | None = None) -> DiffOpt
             "PyYAML is required for --config. Install with `pip install pyyaml`."
         ) from e
 
-    cfg = yaml.safe_load(Path(path).read_text())
+    # 1) Load file; treat empty file as {}
+    cfg = yaml.safe_load(Path(path).read_text()) or {}
 
-    collect_all = bool(cfg.get("collect_all_matches", base_opts.collect_all_matches))
-    max_ok = int(cfg.get("max_ok_rows", base_opts.max_ok_rows))
-    show_for = list(cfg.get("show_matches_for", base_opts.show_matches_for or []))
+    # 2) Ensure base_opts is usable before reading defaults from it
     if base_opts is None:
         base_opts = DiffOptions()
 
+    # 3) Scalars / simple lists
     ignore_private = bool(cfg.get("ignore_private", base_opts.ignore_private))
     ignore_bulk = bool(cfg.get("ignore_bulk", base_opts.ignore_bulk))
     ci = bool(cfg.get("case_insensitive_strings", base_opts.case_insensitive_strings))
     tol = float(cfg.get("numeric_tol", base_opts.numeric_tol.abs_tol))
     ignore_list = list(cfg.get("ignore", base_opts.ignore_tokens or []))
 
-    # sequence_keys: map str -> list[str]
+    # 4) Sequence keys + fallback
     seq_keys: Dict[str, List[str]] = dict(base_opts.sequence_keys or {})
     for k, v in (cfg.get("sequence_keys") or {}).items():
         seq_keys[str(k)] = [str(x) for x in v]
@@ -753,6 +755,11 @@ def load_yaml_config(path: str, base_opts: DiffOptions | None = None) -> DiffOpt
     seq_fallback = str(cfg.get("sequence_fallback", base_opts.sequence_fallback)).lower()
     if seq_fallback not in {"order", "report"}:
         seq_fallback = "order"
+
+    # 5) OK rows / HTML controls
+    collect_all = bool(cfg.get("collect_all_matches", base_opts.collect_all_matches))
+    max_ok = int(cfg.get("max_ok_rows", base_opts.max_ok_rows))
+    show_for = list(cfg.get("show_matches_for", base_opts.show_matches_for or []))
 
     return DiffOptions(
         ignore_private=ignore_private,
