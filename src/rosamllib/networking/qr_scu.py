@@ -246,10 +246,10 @@ class QueryRetrieveSCU:
             ctx.abstract_syntax == context.abstract_syntax for ctx in self.ae.requested_contexts
         ):
             try:
-                self.ae.add_requested_context(context)
+                self.ae.add_requested_context(dataset.SOPClassUID)
             except ValueError:
                 self.ae.requested_contexts.pop()
-                self.ae.add_requested_context(context)
+                self.ae.add_requested_context(dataset.SOPClassUID)
 
         with self.association_context(ae_name) as assoc:
             if assoc:
