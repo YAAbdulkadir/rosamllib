@@ -1,10 +1,13 @@
+import json
 import time
 import logging
 import pandas as pd
-from logging import StreamHandler, FileHandler, Formatter
+from logging import StreamHandler, FileHandler, Formatter, Handler
 from typing import List, Dict, Optional
+from dataclasses import dataclass
 from contextlib import contextmanager
-from pydicom.tag import Tag
+from collections import deque
+from pydicom.tag import Tag, BaseTag
 from pydicom.datadict import dictionary_VR, keyword_for_tag, tag_for_keyword
 from pydicom.sequence import Sequence
 from pydicom.dataset import Dataset
@@ -15,11 +18,36 @@ from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
     StudyRootQueryRetrieveInformationModelMove,
 )
+from pydicom.uid import (
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
+    JPEG2000Lossless,
+    JPEG2000,
+    RLELossless,
+    JPEGBaseline8Bit,
+)
 from rosamllib.constants import VR_TO_DTYPE
 from rosamllib.utils import (
     validate_entry,
     parse_vr_value,
+    _ContextFilter,
+    build_formatter,
+    make_rotating_file_handler,
+    _dedupe_handlers,
+    attach_pynetdicom_to_logger,
 )
+
+_DEFAULT_TS = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
+
+
+@dataclass
+class MoveResult:
+    status: int
+    completed: int = 0
+    failed: int = 0
+    warning: int = 0
+    remaining: int = 0
+    error_comment: Optional[str] = None
 
 
 class QueryRetrieveSCU:
@@ -103,6 +131,11 @@ class QueryRetrieveSCU:
         self.ae.add_requested_context(Verification)
         self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
         self.ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+
+        self._pc_lru = deque()  # abstract syntax UIDs in MRU order
+        self._pc_ts = {}  # abstract syntax UID -> set of transfer syntaxes
+        self._pc_cap = 120  # headroom below 128-limit for QR + Verification
+
         # Configure logger
         if logger is not None:
             self.logger = logger
@@ -154,6 +187,44 @@ class QueryRetrieveSCU:
             if assoc and assoc.is_established:
                 assoc.release()
 
+    def _ensure_requested_context(self, sop_class_uid, ts_list=None):
+        """Merge TS for SOP class; evict true LRU if at capacity; idempotent."""
+        ts = set(ts_list or _DEFAULT_TS)
+
+        if sop_class_uid in self._pc_ts:
+            # merge TS + replace requested context cleanly
+            self._pc_ts[sop_class_uid] |= ts
+            for c in list(self.ae.requested_contexts):
+                if str(c.abstract_syntax) == str(sop_class_uid):
+                    self.ae.requested_contexts.remove(c)
+                    break
+            ctx = build_context(sop_class_uid, list(self._pc_ts[sop_class_uid]))
+            self.ae.add_requested_context(ctx.abstract_syntax, ctx.transfer_syntax)
+            try:
+                self._pc_lru.remove(sop_class_uid)
+            except ValueError:
+                pass
+            self._pc_lru.appendleft(sop_class_uid)
+            return
+
+        # new abstract syntax
+        if len(self._pc_lru) >= self._pc_cap:
+            evict = self._pc_lru.pop()
+            self._pc_ts.pop(evict, None)
+            for c in list(self.ae.requested_contexts):
+                if str(c.abstract_syntax) == str(evict):
+                    self.ae.requested_contexts.remove(c)
+                    break
+
+        self._pc_ts[sop_class_uid] = ts
+        ctx = build_context(sop_class_uid, list(ts))
+        self.ae.add_requested_context(ctx.abstract_syntax, ctx.transfer_syntax)
+        self._pc_lru.appendleft(sop_class_uid)
+
+    def _maybe_add_image_ts(self, sop_class_uid):
+        image_ts = _DEFAULT_TS + [JPEG2000Lossless, JPEG2000, JPEGBaseline8Bit, RLELossless]
+        self._ensure_requested_context(sop_class_uid, image_ts)
+
     def _establish_association(self, ae_name: str, retry_count: int = 3, delay: int = 5):
         """Helper method to establish an association with a remote AE, with retry logic."""
         if ae_name not in self.remote_entities:
@@ -185,124 +256,248 @@ class QueryRetrieveSCU:
 
     def c_echo(self, ae_name: str):
         """Launch a C-ECHO request to verify connectivity with a remote AE."""
+        extra = self._op_ctx(ae_name, "C-ECHO")
+        t0 = time.perf_counter()
         with self.association_context(ae_name) as assoc:
-            if assoc:
-                self.logger.info(f"Association established with {ae_name}. Sending C-ECHO...")
-                status = assoc.send_c_echo()
-                if status.Status == 0x0000:
-                    self.logger.info(f"C-ECHO with '{ae_name}' successful.")
-                    return True
-                else:
-                    self.logger.error(f"C-ECHO with '{ae_name}' failed. Status: {status}")
-                    return False
+            if not assoc:
+                self.logger.error("Failed to associate.", extra=extra)
+                return False
+            self._log_accepted_contexts_debug(assoc)
+            self.logger.info("Association established. Sending C-ECHO...", extra=extra)
+            status = assoc.send_c_echo()
+            extra["status_hex"] = hex(getattr(status, "Status", 0xFFFF))
+            extra["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+            if getattr(status, "Status", None) == 0x0000:
+                self.logger.info("C-ECHO successful.", extra=extra)
+                return True
             else:
-                self.logger.error(f"Failed to associate with {ae_name}.")
+                self.logger.error(f"C-ECHO failed. Status={status}", extra=extra)
                 return False
 
     def c_find(self, ae_name: str, query: Dataset) -> Optional[List[Dataset]]:
         """Perform a C-FIND request using the provided query Dataset."""
+        extra = self._op_ctx(ae_name, "C-FIND", dataset=query)
+        t0 = time.perf_counter()
         with self.association_context(ae_name) as assoc:
-            if assoc:
-                self.logger.info(f"Association established with {ae_name}. Sending C-FIND...")
-                results = []
-                responses = assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
-                for status, identifier in responses:
-                    if status and status.Status in (0xFF00, 0xFF01):
-                        results.append(identifier)
-                return results
-            else:
-                self.logger.error(f"Failed to associate with {ae_name}.")
+            if not assoc:
+                self.logger.error("Failed to associate.", extra=extra)
                 return None
+            self._log_accepted_contexts_debug(assoc)
+            self.logger.info("Association established. Sending C-FIND...", extra=extra)
+
+            results: List[Dataset] = []
+            last_status = None
+            responses = assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
+            for status, identifier in responses:
+                last_status = status
+                if status and status.Status in (0xFF00, 0xFF01):  # Pending
+                    if identifier is not None:
+                        results.append(identifier)
+
+            extra["status_hex"] = (
+                hex(getattr(last_status, "Status", 0xFFFF)) if last_status else None
+            )
+            extra["matches"] = len(results)
+            extra["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+
+            if last_status and last_status.Status == 0x0000:
+                self.logger.info(f"C-FIND completed: {len(results)} matches.", extra=extra)
+            else:
+                self.logger.warning(
+                    f"C-FIND finished with status={last_status}; matches={len(results)}.",
+                    extra=extra,
+                )
+            return results
 
     def c_move(self, ae_name: str, query: Dataset, destination_ae: str):
         """Perform a C-MOVE request to move studies to a specified AE."""
+        extra = self._op_ctx(ae_name, "C-MOVE", dataset=query, destination_ae=destination_ae)
+        t0 = time.perf_counter()
         with self.association_context(ae_name) as assoc:
-            if assoc:
-                self.logger.info(
-                    f"Association established with {ae_name}. "
-                    f"Sending C-MOVE to '{destination_ae}'..."
-                )
-                responses = assoc.send_c_move(
-                    query,
-                    destination_ae,
-                    StudyRootQueryRetrieveInformationModelMove,
-                )
-                for status, _ in responses:
-                    if status.Status == 0x0000:
-                        self.logger.info(f"C-MOVE successful to AE '{destination_ae}'.")
-                        return status
-                    elif status.Status == 0xFF00:
-                        pass
-                    else:
-                        self.logger.error(f"C-MOVE failed. Status: {status}")
-                        return status
+            if not assoc:
+                self.logger.error("Failed to associate.", extra=extra)
+                return None
+            self._log_accepted_contexts_debug(assoc)
+            self.logger.info(
+                f"Association established. Sending C-MOVE to '{destination_ae}'...", extra=extra
+            )
+            result = MoveResult(status=0xFFFF)
+            for status, _ in assoc.send_c_move(
+                query, destination_ae, StudyRootQueryRetrieveInformationModelMove
+            ):
+                if not status:
+                    continue
+                result.status = status.Status
+                # Sub-op counters commonly present in C-MOVE respones
+                for fld in (
+                    "NumberOfRemainingSuboperations",
+                    "NumberOfCompletedSuboperations",
+                    "NumberOfFailedSuboperations",
+                    "NumberOfWarningSuboperations",
+                ):
+                    if hasattr(status, fld):
+                        val = int(getattr(status, fld))
+                        if fld.endswith("RemainingSuboperations"):
+                            result.remaining = val
+                        elif fld.endswith("CompletedSuboperations"):
+                            result.completed = val
+                        elif fld.endswith("FailedSuboperations"):
+                            result.failed = val
+                        elif fld.endswith("WarningSuboperations"):
+                            result.warning = val
+                if hasattr(status, "ErrorComment"):
+                    result.error_comment = str(status.ErrorComment)
+
+            extra.update(
+                {
+                    "status_hex": hex(result.status) if result.status is not None else None,
+                    "completed": result.completed,
+                    "failed": result.failed,
+                    "warning": result.warning,
+                    "remaining": result.remaining,
+                    "duration_ms": int((time.perf_counter() - t0) * 1000),
+                }
+            )
+
+            if result.status == 0x0000:
+                self.logger.info("C-MOVE completed.", extra=extra)
             else:
-                self.logger.error(f"Failed to associate with {ae_name}.")
+                self.logger.error("C-MOVE finished with non-success status.", extra=extra)
+            return result
 
     def c_store(self, ae_name: str, dataset: Dataset):
         """Perform a C-STORE request to store a dataset to a remote AE."""
-        context = build_context(dataset.SOPClassUID)
-        if not any(
-            ctx.abstract_syntax == context.abstract_syntax for ctx in self.ae.requested_contexts
-        ):
-            try:
-                self.ae.add_requested_context(dataset.SOPClassUID)
-            except ValueError:
-                self.ae.requested_contexts.pop()
-                self.ae.add_requested_context(dataset.SOPClassUID)
+        for req in ("SOPClassUID", "SOPInstanceUID"):
+            if not getattr(dataset, req, None):
+                raise ValueError(f"C-STORE dataset missing required attribute: {req}")
+
+        extra = self._op_ctx(ae_name, "C-STORE", dataset=dataset)
+        t0 = time.perf_counter()
+
+        # Ensure storage PC exists
+        self._ensure_requested_context(dataset.SOPClassUID, _DEFAULT_TS)
 
         with self.association_context(ae_name) as assoc:
-            if assoc:
-                self.logger.info(f"Association established with {ae_name}. Sending C-STORE...")
-                status = assoc.send_c_store(dataset)
-                if status.Status == 0x0000:
-                    self.logger.info(f"C-STORE with '{ae_name}' successful.")
-                else:
-                    self.logger.error(f"C-STORE with '{ae_name}' failed. Status: {status}")
-                return status
+            if not assoc:
+                # self.logger.error(f"Failed to associate with {ae_name}.")
+                self.logger.error("Failed to associate.", extra=extra)
+                return None
+            self._log_accepted_contexts_debug(assoc)
+
+            # Guard: ensure peer accepted the Storage PC we need
+            accepted = any(
+                pc.abstract_syntax == dataset.SOPClassUID for pc in assoc.accepted_contexts
+            )
+            if not accepted:
+                acc_list = [
+                    (pc.abstract_syntax.name, [str(ts) for ts in pc.transfer_syntax])
+                    for pc in assoc.accpeted_contexts
+                ]
+                self.logger.error(
+                    "No accepted Storage presentation context for SOP Class.",
+                    extra={**extra, "accepted_pcs": acc_list},
+                )
+                return None
+            self.logger.info("Association established. Sending C-STORE...", extra=extra)
+            status = assoc.send_c_store(dataset)
+
+            extra["status_hex"] = hex(getattr(status, "Status", 0xFFFF))
+            extra["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+
+            if getattr(status, "Status", None) == 0x0000:
+                self.logger.info("C-STORE successful.", extra=extra)
             else:
-                self.logger.error(f"Failed to associate with {ae_name}.")
+                self.logger.error(f"C-STORE failed. Status={status}", extra=extra)
+            return status
 
     @staticmethod
     def convert_results_to_df(results, query_dataset):
-        metadata_list = []
-        for result in results:
-            metadata_list.append(QueryRetrieveSCU._get_metadata(result, query_dataset))
+        if not results:
+            # Return empty DF with columns matching requested keys (by keyword where possible)
+            cols = []
+            for tag in query_dataset.keys():
+                kw = keyword_for_tag(tag)
+                cols.append(kw if kw else int(tag))
+            return pd.DataFrame(columns=cols)
 
-        metadata_df = pd.DataFrame(metadata_list)
+        metadata_list = [QueryRetrieveSCU._get_metadata(r, query_dataset) for r in results]
+        df = pd.DataFrame(metadata_list)
 
-        for col in metadata_df.columns:
+        for col in df.columns:
+            # Determine VR by tag or keyword
+            vr = None
             try:
-                vr = dictionary_VR(Tag(tag_for_keyword(col)))
-            except TypeError:
-                vr = dictionary_VR(Tag(col))
+                if isinstance(col, (int, BaseTag)):
+                    vr = dictionary_VR(Tag(col))
+                else:
+                    vr = dictionary_VR(Tag(tag_for_keyword(col)))
+            except (KeyError, TypeError, ValueError):
+                vr = None
+
             dtype = VR_TO_DTYPE.get(vr, object)
             if dtype == "date":
-                metadata_df[col] = pd.to_datetime(metadata_df[col], errors="coerce")
+                df[col] = pd.to_datetime(df[col], errors="coerce")
             elif dtype == "time":
-                metadata_df[col] = pd.to_datetime(
-                    metadata_df[col], format="%H:%M:%S", errors="coerce"
-                ).dt.time
+                df[col] = pd.to_datetime(df[col], format="%H:%M:%S", errors="coerce").dt.time
             elif dtype == "datetime":
-                metadata_df[col] = pd.to_datetime(metadata_df[col], errors="coerce")
+                df[col] = pd.to_datetime(df[col], errors="coerce")
             else:
-                metadata_df[col] = metadata_df[col].astype(dtype, errors="ignore")
-        return metadata_df
+                # Avoid pandas warnings with nullable types
+                try:
+                    df[col] = df[col].astype(dtype)
+                except Exception:
+                    pass
+        return df
 
     @staticmethod
     def _get_metadata(result_dataset, query_dataset):
-        metadata = {}
-        all_tags = list(query_dataset.keys())
-        for tag in all_tags:
+        md = {}
+        for tag in list(query_dataset.keys()):
             vr = dictionary_VR(tag)
             value = result_dataset[tag].value if tag in result_dataset else None
+            key = keyword_for_tag(tag) or int(tag)
             if isinstance(value, Sequence) and vr == "SQ":
-                metadata[keyword_for_tag(tag) or tag] = (
-                    (result_dataset[tag].to_json()) if value else None
-                )
+                try:
+                    # pydicom 3.0+: Dataset.json() exists; else fallback
+                    md[key] = (
+                        result_dataset[tag].to_json()
+                        if hasattr(result_dataset[tag], "to_json")
+                        else json.dumps([ds.to_json_dict() for ds in value])
+                    )
+                except Exception:
+                    md[key] = None
             else:
-                metadata[keyword_for_tag(tag) or tag] = parse_vr_value(vr, value)
-        return metadata
+                md[key] = parse_vr_value(vr, value)
+        return md
+
+    def _op_ctx(
+        self,
+        ae_name: str,
+        op: str,
+        *,
+        dataset: Dataset | None = None,
+        destination_ae: str | None = None,
+    ):
+        rm = self.remote_entities.get(ae_name, {})
+        ctx = {
+            "op": op,
+            "ae_name": ae_name,
+            "remote_host": rm.get("host"),
+            "remote_port": rm.get("port"),
+            "sop_class": (
+                str(getattr(dataset, "SOPClassUID", None)) if dataset is not None else None
+            ),
+            "study_uid": (
+                getattr(dataset, "StudyInstanceUID", None) if dataset is not None else None
+            ),
+            "series_uid": (
+                getattr(dataset, "SeriesInstanceUID", None) if dataset is not None else None
+            ),
+            "sop_uid": getattr(dataset, "SOPInstanceUID", None) if dataset is not None else None,
+        }
+        if destination_ae:
+            ctx["destination_ae"] = destination_ae
+        return ctx
 
     def set_logger(self, new_logger: logging.Logger):
         """Set a new logger for the class, overriding the existing one."""
@@ -337,6 +532,11 @@ class QueryRetrieveSCU:
         log_file_path: str = "store_scp.log",
         log_level: int = logging.INFO,
         formatter: Optional[Formatter] = None,
+        json_logs: bool = False,
+        rotate: bool = True,
+        max_bytes: int = 10_000_000,
+        backup_count: int = 5,
+        static_context: Optional[Dict] = None,
     ):
         """Configure logging with console and/or file handlers.
 
@@ -352,39 +552,107 @@ class QueryRetrieveSCU:
             The logging level (e.g., logging.INFO, logging.DEBUG).
         formatter : Optional[Formatter]
             A custom formatter for the log messages. If None, a default formatter is used.
+
+        Returns
+        -------
+        Dict[str, logging.Handlers]
+            The handlers that were added, keyed by "console" and/or "file".
         """
+        # formatter
         if formatter is None:
-            formatter = Formatter("%(levelname).1s: %(asctime)s: %(name)s: %(message)s")
+            formatter = build_formatter(human=not json_logs)
 
-        console_handler = next(
-            (h for h in self.logger.handlers if isinstance(h, StreamHandler)), None
-        )
+        # attach a context filter so evey log carries these fields
+        ctx = static_context or {"component": "QueryRetrieveSCU"}
+        # avoid adding the same filter multiple times
+        if not any(isinstance(f, _ContextFilter) for f in self.logger.filters):
+            self.logger.addFilter(_ContextFilter(**ctx))
 
+        self.logger.setLevel(log_level)
+        self.logger.propagate = False  # avoid duplicate logs via root
+
+        added: Dict[str, Handler] = {}
+
+        # Console
         if log_to_console:
-            if not console_handler:
-                console_handler = StreamHandler()
-                console_handler.setLevel(log_level)
-                console_handler.setFormatter(formatter)
-                self.logger.addHandler(console_handler)
+            if not any(isinstance(h, StreamHandler) for h in self.logger.handlers):
+                ch = StreamHandler()
+                ch.setLevel(log_level)
+                ch.setFormatter(formatter)
+                self.logger.addHandler(ch)
+                added["console"] = ch
         else:
-            if console_handler:
-                self.logger.removeHandler(console_handler)
+            for h in list(self.logger.handlers):
+                if isinstance(h, StreamHandler):
+                    self.logger.removeHandler(h)
 
-        file_handler = next(
-            (
-                h
-                for h in self.logger.handlers
-                if isinstance(h, FileHandler) and h.baseFilename == log_file_path
-            ),
-            None,
-        )
+        # File
         if log_to_file:
-            if not file_handler:
-                file_handler = FileHandler(log_file_path)
-                file_handler.setLevel(log_level)
-                file_handler.setFormatter(formatter)
-                self.logger.addHandler(file_handler)
-
+            # ensure only one file handler for the given path
+            existing = next(
+                (
+                    h
+                    for h in self.logger.handlers
+                    if isinstance(h, FileHandler)
+                    and getattr(h, "baseFilename", "") == log_file_path
+                ),
+                None,
+            )
+            if existing is None:
+                if rotate:
+                    fh = make_rotating_file_handler(
+                        log_file_path,
+                        log_level,
+                        formatter,
+                        max_bytes=max_bytes,
+                        backup_count=backup_count,
+                    )
+                else:
+                    fh = FileHandler(log_file_path)
+                    fh.setLevel(log_level)
+                    fh.setFormatter(formatter)
+                self.logger.addHandler(fh)
+                added["file"] = fh
         else:
-            if file_handler:
-                self.logger.removeHandler(file_handler)
+            for h in list(self.logger.handlers):
+                if isinstance(h, FileHandler):
+                    self.logger.removeHandler(h)
+
+        _dedupe_handlers(self.logger)
+        return added
+
+    def enable_wire_debug(self, enable: bool = True, level: int = logging.DEBUG):
+        """Enable/disable verbose pynetdicom + route through our logger."""
+        attach_pynetdicom_to_logger(enable, level)
+
+    def set_log_level(self, level: int):
+        """Dynamic level change."""
+        self.logger.setLevel(level)
+        for h in self.logger.handlers:
+            h.setLevel(level)
+
+    def log_accepted_contexts(self, assoc) -> None:
+        rows = []
+        for pc in assoc.accepted_contexts:
+            ts_list = ", ".join(str(ts) for ts in pc.transfer_syntax)
+            rows.append(f"{pc.abstract_syntax.name} [{ts_list}]")
+        self.logger.debug("Accepted presentation contexts:\n  - " + "\n  - ".join(rows))
+
+    def close_log_handlers(self):
+        for h in list(self.logger.handlers):
+            try:
+                h.flush()
+                h.close()
+            finally:
+                self.logger.removeHandler(h)
+
+    def _log_accepted_contexts_debug(self, assoc):
+        """Emit accepted PCs at DEBUG level (handy for diagnosing rejections)."""
+        if not self.logger.isEnabledFor(logging.DEBUG) or not assoc:
+            return
+        lines = []
+        for pc in assoc.accepted_contexts:
+            ts_list = ", ".join(str(ts) for ts in pc.transfer_syntax)
+            lines.append(f"{pc.abstract_syntax.name} [{ts_list}]")
+        if lines:
+            self.logger.debug("Accepted presentation contexts:\n  - " + "\n  - ".join(lines))
