@@ -3,14 +3,66 @@ Class module for DICOM SCP
 """
 
 import logging
+import time
 import pynetdicom.sop_class as sop_class
-from logging import StreamHandler, FileHandler, Formatter
-from typing import Optional, Callable, List
+from logging import StreamHandler, FileHandler, Formatter, Handler
+from typing import Optional, Callable, List, Dict
 from pydicom.dataset import Dataset
 from pynetdicom import AE, StoragePresentationContexts, evt, register_uid
 from pynetdicom.sop_class import Verification
 from pynetdicom.service_class import StorageServiceClass
-from rosamllib.utils import validate_entry
+from rosamllib.utils import (
+    validate_entry,
+    attach_pynetdicom_to_logger,
+    build_formatter,
+    _ContextFilter,
+    make_rotating_file_handler,
+    _dedupe_handlers,
+)
+
+
+# Status constants (common DICOM codes)
+STATUS_SUCCESS = 0x0000
+STATUS_OUT_OF_RESOURCES = 0xA700
+STATUS_DATASET_MISMATCH = 0xA900
+STATUS_CANNOT_UNDERSTAND = 0xC000  # general processing failure
+
+
+def _mask(s: str | None, keep: int = 6) -> str | None:
+    """Mask potentially identifying strings in logs (keep first `keep` chars)."""
+    if not s or len(s) <= keep:
+        return s
+    return s[:keep] + "..."
+
+
+def _ctx_from_event(event, op: str, mask_phi: bool = True):
+    """Build structured logging context from a pynetdicom event."""
+    assoc = getattr(event, "assoc", None)
+    dset = getattr(event, "dataset", None)
+    requestor = getattr(assoc, "requestor", None)
+    acceptor = getattr(assoc, "acceptor", None)
+
+    calling_ae = requestor.ae_title if requestor else None
+    called_ae = acceptor.ae_title if acceptor else None
+    remote = getattr(event, "address", None)
+    hostport = f"{remote[0]}:{remote[1]}" if remote else None
+
+    def get(attr: str):
+        return getattr(dset, attr, None) if dset is not None else None
+
+    val = (lambda x: _mask(x)) if mask_phi else (lambda x: x)
+
+    return {
+        "op": op,
+        "calling_ae": calling_ae,
+        "called_ae": called_ae,
+        "remote_addr": hostport,
+        "modality": get("Modality"),
+        "sop_class": str(get("SOPClassUID")),
+        "sop_uid": val(get("SOPInstanceUID")),
+        "study_uid": val(get("StudyInstanceUID")),
+        "series_uid": val(get("SeriesInstanceUID")),
+    }
 
 
 class StoreSCP:
@@ -84,6 +136,7 @@ class StoreSCP:
         dimse_timeout: int = 121,
         network_timeout: int = 122,
         logger: Optional[logging.Logger] = None,
+        mask_phi_logs: bool = False,
     ):
         """Initialize the SCP to handle store requests.
 
@@ -125,6 +178,9 @@ class StoreSCP:
         self.ae.dimse_timeout = dimse_timeout
         self.ae.network_timeout = network_timeout
 
+        self._server = None
+        self._server_running = None
+
         # Configure logger
         if logger is not None:
             self.logger = logger
@@ -147,6 +203,11 @@ class StoreSCP:
             f"{self.scpAET}, IP: {self.scpIP}, Port: {self.scpPort}"
         )
 
+        self._mask_phi_logs = mask_phi_logs
+
+    def is_running(self) -> bool:
+        return self._server_running
+
     def handle_open(self, event):
         """Log association establishments.
 
@@ -155,17 +216,19 @@ class StoreSCP:
         event : `events.Event`
             A DICOM association establishment event
         """
-        msg = f"Connected with remote at {event.address}"
-        self.logger.info(msg)
+        extra = _ctx_from_event(event, "ASSOC-OPEN", mask_phi=self._mask_phi_logs)
+        self.logger.info("Association opened.", extra=extra)
 
         # Run custom functions
         for func in self.custom_functions_open:
             try:
-                self.logger.debug(f"Running custom function {func.__name__} in handle_open")
+                self.logger.debug(
+                    f"Running custom function {func.__name__} in handle_open", extra=extra
+                )
                 func(event)
             except Exception as e:
                 self.logger.error(
-                    f"Error running custom function {func.__name__} in handle_open: {e}"
+                    f"Error in handle_open callback {func.__name__}: {e}", extra=extra
                 )
 
     def handle_close(self, event):
@@ -176,17 +239,20 @@ class StoreSCP:
         event : `events.Event`
             A DICOM association close event
         """
-        msg = f"Disconnected from remote at {event.address}"
-        self.logger.info(msg)
+
+        extra = _ctx_from_event(event, "ASSOC-CLOSE", mask_phi=self._mask_phi_logs)
+        self.logger.info("Association closed.", extra=extra)
 
         # Run custom functions
-        for func in self.custom_functions_close:
+        for func in self.custom_funcions_close:
             try:
-                self.logger.debug(f"Running custom funcion {func.__name__} in handle_close.")
+                self.logger.debug(
+                    f"Running custom function {func.__name__} in handle_close.", extra=extra
+                )
                 func(event)
             except Exception as e:
                 self.logger.error(
-                    f"Error running custom function {func.__name__} in handle_close: {e}"
+                    f"Error in handle_close callback {func.__name__}: {e}", extra=extra
                 )
 
     def handle_store(self, event) -> Dataset:
@@ -201,18 +267,24 @@ class StoreSCP:
         Dataset
             The status message to respond with
         """
-        msg = f"Received {event.dataset.Modality} with SOPInstanceUID={event.dataset.Modality}."
-        self.logger.debug(msg)
+        t0 = time.perf_counter()
+        extra = _ctx_from_event(event, "C-STORE", mask_phi=True)
+
         try:
             # Run custom functions
-            for func in self.custom_functions_store:
+            for func in list(self.custom_functions_store):
                 try:
-                    self.logger.debug(f"Running custom function {func.__name__}  in handle_store")
+                    self.logger.debug(
+                        f"Running custom store function {func.__name__}", extra=extra
+                    )
                     func(event)
                 except Exception as e:
                     self.logger.error(
-                        f"Error running custom function {func.__name__} in handle_store: {e}"
+                        f"Custom store function {func.__name__} failed: {e}", extra=extra
                     )
+
+            dur = int((time.perf_counter() - t0) * 1000)
+            self.logger.info(f"C-STORE OK in {dur} ms.", extra={**extra, "duration_ms": dur})
 
             status_ds = Dataset()
             status_ds.Status = 0x0000
@@ -231,36 +303,128 @@ class StoreSCP:
         self.handlers.append((evt.EVT_CONN_OPEN, self.handle_open))
         self.handlers.append((evt.EVT_CONN_CLOSE, self.handle_close))
         self.handlers.append((evt.EVT_C_STORE, self.handle_store))
+        self.handlers.append((evt.EVT_REQUESTED, self._on_assoc_requested))
+        self.handlers.append((evt.EVT_ACCEPTED, self._on_assoc_requested))
+        self.handlers.append((evt.EVT_REJECTED, self._on_assoc_rejected))
+        self.handlers.append((evt.EVT_ABORTED, self._on_abort))
+        self.handlers.append((evt.EVT_C_STORE, self.handle_store))
+
+    def _on_assoc_requested(self, event):
+        extra = _ctx_from_event(event, "ASSOC-REQ", mask_phi=self._mask_phi_logs)
+        # Include proposed presentation contexts at DEBUG for diagnostics
+        if self.logger.isEnabledFor(logging.DEBUG):
+            pcs = event.requestor.requested_contexts
+            lines = []
+            for pc in pcs:
+                ts = ", ".join(str(ts) for ts in pc.transfer_syntax)
+                lines.append(f"{pc.abstract_syntax.name} [{ts}]")
+            if lines:
+                self.logger.debug(
+                    "Proposed presentation contexts:\n - " + "\n  - ".join(lines), extra=extra
+                )
+        self.logger.info("Association requested.", extra=extra)
+
+    def _on_assoc_accepted(self, event):
+        extra = _ctx_from_event(event, "ASSOC-ACC", mask_phi=self._mask_phi_logs)
+        # Log accepted PCs at DEBUG
+        if self.logger.isEnabledFor(logging.DEBUG):
+            pcs = event.acceptor.accepted_contexts
+            lines = []
+            for pc in pcs:
+                ts = ", ".join(str(ts) for ts in pc.transfer_syntax)
+                lines.append(f"{pc.abstract_syntax.name} [{ts}]")
+            if lines:
+                self.logger.debug(
+                    "Accepted presentation contexts:\n  - " + "\n  - ".join(lines), extra=extra
+                )
+        self.logger.info("Association accepted.", extra=extra)
+
+    def _on_assoc_rejected(self, event):
+        extra = _ctx_from_event(event, "ASSOC-REJ", mask_phi=self._mask_phi_logs)
+        # pynetdicom provides result, source, reason
+        details = dict(
+            result=getattr(event, "result", None),
+            source=getattr(event, "source", None),
+            reason=getattr(event, "reason", None),
+        )
+        self.logger.error(f"Association rejected: {details}", extra=extra)
+
+    def _on_abort(self, event):
+        extra = _ctx_from_event(event, "ASSOC-ABRT", mask_phi=self._mask_phi_logs)
+        self.logger.error("Association aborted.", extra=extra)
+
+    def _on_c_echo(self, event):
+        extra = _ctx_from_event(event, "C-ECHO", mask_phi=self._mask_phi_logs)
+        self.logger.info("C-ECHO received.", extra=extra)
+        return 0x0000
 
     def start(self, block: bool = False):
-        """Start the DICOM SCP server.
+        if self._server_running:
+            self.logger.warning(
+                f"SCP already running at {self.scpIP}:{self.scpPort} "
+                f"(AET={self.scpAET}); ignoring start().",
+                extra={
+                    "op": "SCP-START",
+                    "called_ae": self.scpAET,
+                    "remote_addr": f"{self.scpIP}:{self.scpPort}",
+                },
+            )
+            return
 
-        Parameters
-        ----------
-        block : bool, optional
-            Whether to block the thread that called this method, by default False
-        """
-
+        self.logger.info(
+            f"Starting SCP {self.scpAET} on {self.scpIP}:{self.scpPort}",
+            extra={
+                "op": "SCP-START",
+                "called_ae": self.scpAET,
+                "remote_addr": f"{self.scpIP}:{self.scpPort}",
+            },
+        )
         try:
-            msg = f"Started SCP with AE Title {self.scpAET} on port {self.scpPort}"
-            self.logger.info(msg)
-
-            self.ae.start_server(
+            self._server = self.ae.start_server(
                 (self.scpIP, self.scpPort), block=block, evt_handlers=self.handlers
             )
-
+            # If we got here without exception, consider it running
+            self._server_running = True
+            if not block:
+                self.logger.info(
+                    "SCP started (background).",
+                    extra={"op": "SCP-START", "called_ae": self.scpAET, "alive": True},
+                )
         except Exception as e:
-            self.logger.error(f"Could not start SCP. {e}")
+            self._server = None
+            self._server_running = False
+            self.logger.error(
+                f"Could not start SCP: {e}", extra={"op": "SCP-START", "called_ae": self.scpAET}
+            )
 
     def stop(self):
-        """Stop the DICOM SCP server."""
+        """Stop the DICOM SCP server (idempotent)."""
+        if not self._server_running:
+            self.logger.info(
+                "SCP stop requested but server was not running.",
+                extra={"op": "SCP-STOP", "called_ae": self.scpAET},
+            )
+            return
+
+        self.logger.info("Stopping SCP…", extra={"op": "SCP-STOP", "called_ae": self.scpAET})
         try:
-            self.ae.shutdown()
-            msg = "Stopped SCP"
-            self.logger.info(msg)
+            if self._server:
+                # Works across pynetdicom versions that return a server handle
+                try:
+                    self._server.shutdown()
+                except AttributeError:
+                    # Older versions: fall back to AE.shutdown()
+                    pass
+            self.ae.shutdown()  # safe to call regardless
         except Exception as e:
-            msg = f"Exception raised while stopping SCP. {e}"
-            self.logger.error(msg)
+            self.logger.error(
+                f"Exception during shutdown: {e}",
+                extra={"op": "SCP-STOP", "called_ae": self.scpAET},
+            )
+        finally:
+            self._server = None
+            self._server_running = False
+            self.logger.info("SCP stopped.", extra={"op": "SCP-STOP", "called_ae": self.scpAET})
 
     def add_custom_function_store(self, func: Callable[[evt.Event], None]):
         """
@@ -494,6 +658,11 @@ class StoreSCP:
         log_file_path: str = "store_scp.log",
         log_level: int = logging.INFO,
         formatter: Optional[Formatter] = None,
+        json_logs: bool = False,
+        rotate: bool = True,
+        max_bytes: int = 10_000_000,
+        backup_count: int = 5,
+        static_context: Optional[Dict] = None,
     ):
         """Configure logging with console and/or file handlers.
 
@@ -509,39 +678,107 @@ class StoreSCP:
             The logging level (e.g., logging.INFO, logging.DEBUG).
         formatter : Optional[Formatter]
             A custom formatter for the log messages. If None, a default formatter is used.
+
+        Returns
+        -------
+        Dict[str, logging.Handlers]
+            The handlers that were added, keyed by "console" and/or "file".
         """
+        # formatter
         if formatter is None:
-            formatter = Formatter("%(levelname).1s: %(asctime)s: %(name)s: %(message)s")
+            formatter = build_formatter(human=not json_logs)
 
-        console_handler = next(
-            (h for h in self.logger.handlers if isinstance(h, StreamHandler)), None
-        )
+        # attach a context filter so evey log carries these fields
+        ctx = static_context or {"component": "QueryRetrieveSCU"}
+        # avoid adding the same filter multiple times
+        if not any(isinstance(f, _ContextFilter) for f in self.logger.filters):
+            self.logger.addFilter(_ContextFilter(**ctx))
 
+        self.logger.setLevel(log_level)
+        self.logger.propagate = False  # avoid duplicate logs via root
+
+        added: Dict[str, Handler] = {}
+
+        # Console
         if log_to_console:
-            if not console_handler:
-                console_handler = StreamHandler()
-                console_handler.setLevel(log_level)
-                console_handler.setFormatter(formatter)
-                self.logger.addHandler(console_handler)
+            if not any(isinstance(h, StreamHandler) for h in self.logger.handlers):
+                ch = StreamHandler()
+                ch.setLevel(log_level)
+                ch.setFormatter(formatter)
+                self.logger.addHandler(ch)
+                added["console"] = ch
         else:
-            if console_handler:
-                self.logger.removeHandler(console_handler)
+            for h in list(self.logger.handlers):
+                if isinstance(h, StreamHandler):
+                    self.logger.removeHandler(h)
 
-        file_handler = next(
-            (
-                h
-                for h in self.logger.handlers
-                if isinstance(h, FileHandler) and h.baseFilename == log_file_path
-            ),
-            None,
-        )
+        # File
         if log_to_file:
-            if not file_handler:
-                file_handler = FileHandler(log_file_path)
-                file_handler.setLevel(log_level)
-                file_handler.setFormatter(formatter)
-                self.logger.addHandler(file_handler)
-
+            # ensure only one file handler for the given path
+            existing = next(
+                (
+                    h
+                    for h in self.logger.handlers
+                    if isinstance(h, FileHandler)
+                    and getattr(h, "baseFilename", "") == log_file_path
+                ),
+                None,
+            )
+            if existing is None:
+                if rotate:
+                    fh = make_rotating_file_handler(
+                        log_file_path,
+                        log_level,
+                        formatter,
+                        max_bytes=max_bytes,
+                        backup_count=backup_count,
+                    )
+                else:
+                    fh = FileHandler(log_file_path)
+                    fh.setLevel(log_level)
+                    fh.setFormatter(formatter)
+                self.logger.addHandler(fh)
+                added["file"] = fh
         else:
-            if file_handler:
-                self.logger.removeHandler(file_handler)
+            for h in list(self.logger.handlers):
+                if isinstance(h, FileHandler):
+                    self.logger.removeHandler(h)
+
+        _dedupe_handlers(self.logger)
+        return added
+
+    def enable_wire_debu(self, enable: bool = True, level: int = logging.DEBUG):
+        """Enable/disable verbose pynetdicom + route through our logger."""
+        attach_pynetdicom_to_logger(enable, level)
+
+    def set_log_level(self, level: int):
+        """Dynamic level change."""
+        self.logger.setLevel(level)
+        for h in self.logger.handlers:
+            h.setLevel(level)
+
+    def log_accepted_contexts(self, assoc) -> None:
+        rows = []
+        for pc in assoc.accepted_contexts:
+            ts_list = ", ".join(str(ts) for ts in pc.transfer_syntax)
+            rows.append(f"{pc.abstract_syntax.name} [{ts_list}]")
+        self.logger.debug("Accepted presentation contexts:\n  - " + "\n  - ".join(rows))
+
+    def close_log_handlers(self):
+        for h in list(self.logger.handlers):
+            try:
+                h.flush()
+                h.close()
+            finally:
+                self.logger.removeHandler(h)
+
+    def _log_accepted_contexts_debug(self, assoc):
+        """Emit accepted PCs at DEBUG level (handy for diagnosing rejections)."""
+        if not self.logger.isEnabledFor(logging.DEBUG) or not assoc:
+            return
+        lines = []
+        for pc in assoc.accepted_contexts:
+            ts_list = ", ".join(str(ts) for ts in pc.transfer_syntax)
+            lines.append(f"{pc.abstract_syntax.name} [{ts_list}]")
+        if lines:
+            self.logger.debug("Accepted presentation contexts:\n  - " + "\n  - ".join(lines))
