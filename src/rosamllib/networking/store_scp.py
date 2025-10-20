@@ -244,7 +244,7 @@ class StoreSCP:
         self.logger.info("Association closed.", extra=extra)
 
         # Run custom functions
-        for func in self.custom_funcions_close:
+        for func in self.custom_functions_close:
             try:
                 self.logger.debug(
                     f"Running custom function {func.__name__} in handle_close.", extra=extra
