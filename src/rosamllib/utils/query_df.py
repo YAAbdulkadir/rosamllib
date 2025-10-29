@@ -144,6 +144,11 @@ def _maybe_coerce_temporal(series: pd.Series, value):
     if not kind:
         return value
 
+    # If a wildcard string is supplied, skip temporal coercion so that the
+    # equality/wildcard machinery can handle it (e.g., StudyDate="*").
+    if isinstance(value, str) and ("*" in value or "?" in value):
+        return value
+
     # lists/tuples: coerce each item
     if isinstance(value, (list, tuple)):
         return type(value)(_parse_temporal_literal(kind, v) for v in value)
