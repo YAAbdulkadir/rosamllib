@@ -15,6 +15,7 @@ from pydicom import dcmread
 from pydicom.tag import Tag, BaseTag
 from pydicom.datadict import keyword_for_tag, tag_for_keyword, dictionary_VR
 from dataclasses import dataclass
+from rosamllib.dicoms.rtimage import RTIMAGE
 from rosamllib.readers import (
     DICOMImageReader,
     RTStructReader,
@@ -499,6 +500,15 @@ def process_seg_file(filepath, tag_plan, seq_policy):
     return instance_dict
 
 
+def process_other_file(filepath, tag_plan, seq_policy):
+    ds = dcmread(filepath, stop_before_pixels=True)
+    metadata = get_metadata(ds, tag_plan, seq_policy)
+    instance_dict = {"FilePath": filepath, **metadata}
+    refs_map = get_referenced_sop_instance_uids(ds)
+    instance_dict["ReferencedSOPInstanceUIDs"] = list(chain.from_iterable(refs_map.values()))
+    return instance_dict
+
+
 def process_file(filepath, tag_plan, seq_policy):
     try:
         # specific = _build_specific_tags_set(tag_plan)
@@ -521,7 +531,7 @@ def process_file(filepath, tag_plan, seq_policy):
         elif modality == "SEG":
             instance_dict = process_seg_file(filepath, tag_plan, seq_policy)
         else:
-            return []
+            instance_dict = process_other_file(filepath, tag_plan, seq_policy)
 
         out = [instance_dict]
         out.extend(embedded_instances)
@@ -2029,6 +2039,10 @@ class DICOMLoader:
             return [
                 SEGReader(instance_path).read() for instance_path in found_series.instance_paths
             ]
+        elif modality == "RTIMAGE":
+            return [
+                RTIMAGE(dcmread(instance_path)) for instance_path in found_series.instance_paths
+            ]
 
         else:
             raise NotImplementedError(f"A reader for {modality} type is not implemented yet.")
@@ -2099,6 +2113,8 @@ class DICOMLoader:
 
         elif modality == "SEG":
             return SEGReader(filepath).read()
+        elif modality == "RTIMAGE":
+            return RTIMAGE(dcmread(filepath))
 
         else:
             raise NotImplementedError(f"A reader for {modality} type is not implemented yet.")
@@ -3048,7 +3064,6 @@ class DICOMLoader:
             # second pass: add edges based on references
             for study_uid, grouped in grouped_series.items():
                 if study_uid != "UNK":
-                    # if True:
                     for series_uid, series in grouped.items():
                         # Exclude modalities if specified
                         if exclude_modalities and series.Modality in exclude_modalities:
@@ -3163,6 +3178,22 @@ class DICOMLoader:
                                         series.SeriesInstanceUID,
                                         referenced_series_uid,
                                     )
+                            else:
+                                # Check if the series references other instances directly
+                                referenced_instances = self.get_referenced_nodes(
+                                    series, level="INSTANCE", recursive=False
+                                )
+                                if referenced_instances:
+                                    for ref_inst in referenced_instances:
+                                        if not exclude_referenced(ref_inst.parent_series):
+                                            referencing_nodes_set.add(ref_inst.SOPInstanceUID)
+
+                                            # Draw an edge pointing *upwards* from the
+                                            # referenced node to the referencing node
+                                            graph.edge(
+                                                series.SeriesInstanceUID,
+                                                ref_inst.SOPInstanceUID,
+                                            )
 
                             # Check for REG modality and moving image reference
                             # (other_referenced_sid)
