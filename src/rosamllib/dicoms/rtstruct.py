@@ -660,3 +660,12 @@ class RTStruct(rt_utils.RTStruct):
         else:
             last_roi_number = 0
         return last_roi_number
+
+    def __contains__(self, key):
+        return key in self.ds
+
+    def __getitem__(self, key):
+        return self.ds[key]
+
+    def keys(self):
+        return self.ds.keys()
