@@ -631,3 +631,12 @@ class REG:
             plt.show()
         else:
             print("No deformation grid data available for visualization.")
+
+    def __contains__(self, key):
+        return key in self.reg_dataset
+
+    def __getitem__(self, key):
+        return self.reg_dataset[key]
+
+    def keys(self):
+        return self.reg_dataset.keys()
