@@ -526,8 +526,7 @@ def process_file(filepath, tag_plan, seq_policy):
         out = [instance_dict]
         out.extend(embedded_instances)
         return out
-    except Exception as e:
-        print(e)
+    except Exception:
         return []
 
 
@@ -677,9 +676,8 @@ class DICOMLoader:
             else:
                 self.load_file(self.path, seq_policy=seq_policy, tag_plan=tag_plan)
 
-        except Exception as e:
-            print(f"Error loading DICOM files: {e}")
-            print(traceback.format_exc())
+        except Exception:
+            pass
 
     def load_from_directory(self, path, seq_policy, tag_plan=None):
         """
@@ -1103,7 +1101,7 @@ class DICOMLoader:
                 raise ValueError(f"Unknown keyword '{tag}'")
             return (t.group, t.element)
         except Exception:
-            print(f"Unknown tag/keyword '{tag}' ignored.")
+            # print(f"Unknown tag/keyword '{tag}' ignored.")
             return None
 
     def _get_column_dtype(self, tag):
