@@ -104,3 +104,12 @@ class RTPlan:
             List of all attributes, including DICOM metadata keywords.
         """
         return self.__dir__()
+
+    def __contains__(self, key):
+        return key in self.plan_dataset
+
+    def __getitem__(self, key):
+        return self.plan_dataset[key]
+
+    def keys(self):
+        return self.plan_dataset.keys()
