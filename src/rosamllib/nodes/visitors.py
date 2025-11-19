@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Callable, Optional, Dict, Any, List, Union, Tuple, Set
 from dataclasses import dataclass, field
-from rosamllib.readers.query_dicom import query_instances, QueryOptions
+from rosamllib.nodes.query_dicom import query_instances, QueryOptions
 import weakref
 
 
