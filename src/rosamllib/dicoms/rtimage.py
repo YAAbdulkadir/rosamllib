@@ -69,7 +69,8 @@ We extract field geometry at the **isocenter plane** from the referenced (or sup
 DICOM OVERLAYS (group 60xx)
 ---------------------------
 For each 60xx group:
-    Rows (60xx,0010), Columns (60xx,0011), OverlayOrigin (60xx,0050; 1-based), OverlayData (60xx,3000)
+    Rows (60xx,0010), Columns (60xx,0011), OverlayOrigin (60xx,0050; 1-based), OverlayData
+    (60xx,3000)
 We unpack bit-packed OverlayData into a binary mask, place it at (origin) in a full-frame canvas,
 and alpha-composite over the grayscale RTIMAGE.
 
@@ -83,11 +84,13 @@ Iso-plane projection (pixels ↔ iso):
     RTImageSID (3002,0026), RadiationMachineSAD (3002,0022)
 
 IEC BEV→patient mapping:
-    (Above) + GantryAngle, BeamLimitingDeviceAngle, PatientSupportAngle (defaults to 0.0 if missing)
+    (Above) + GantryAngle, BeamLimitingDeviceAngle, PatientSupportAngle
+    (defaults to 0.0 if missing)
 
 RTPLAN overlays:
     RTPLAN with BeamSequence.ControlPointSequence
-    • Jaws: BeamLimitingDevicePositionSequence item with RTBeamLimitingDeviceType in {'X','ASYMX','Y','ASYMY'}
+    • Jaws: BeamLimitingDevicePositionSequence item with RTBeamLimitingDeviceType in
+        {'X','ASYMX','Y','ASYMY'}
     • MLC:  BeamLimitingDeviceSequence with {RTBeamLimitingDeviceType in {'MLCX','MLCY'}}
             and corresponding BeamLimitingDevicePositionSequence in ControlPointSequence
     • Optional: LeafPositionBoundaries
@@ -172,7 +175,7 @@ def _axis_angle(axis: np.ndarray, theta_deg: float) -> np.ndarray:
     )
 
 
-class RTIMAGE:
+class RTIMAGE(Dataset):
     """
     RTIMAGE convenience wrapper focused on **EPID/portal images** with:
       1) Robust, vendor-tolerant metadata extraction (spacing, SID/SAD, angles, linkage)
@@ -223,12 +226,13 @@ class RTIMAGE:
 
     GUARANTEES (WHAT CALLERS CAN RELY ON)
     -------------------------------------
-    • `get_geometry()` / `summary()` return dicts with stable keys and `None` where data is missing.
+    • `get_geometry()` / `summary()` return dicts with stable keys and `None` where
+        data is missing.
     • `get_pixel_array_float()` always returns float32 with RescaleSlope/Intercept applied.
     • `window_image()` always returns an image in [0,1]; if WL/WW tags are missing, robust 5-95%
       percentile window is used.
-    • `pixel_to_isocenter_bev()` and `iso_to_pixels()` are consistent inverses under the pinhole model,
-      given stable (SID,SAD,spacing) and the same principal point.
+    • `pixel_to_isocenter_bev()` and `iso_to_pixels()` are consistent inverses under the pinhole
+        model, given stable (SID,SAD,spacing) and the same principal point.
     • Jaws/MLC outlines returned are **on the isocenter plane** in BEV (u,v) mm.
 
     LIMITATIONS (BY DESIGN, FOR NOW)
@@ -239,9 +243,11 @@ class RTIMAGE:
     • **Animated MLC/Jaws**: We read only the **first control point** for the overlay.
       Extension: select CP index, time/sample, or animate.
     • **Missing `LeafPositionBoundaries`**: If absent, we approximate equal spacing across the
-      corresponding jaws; good enough for quick QA drawings, but we'll add vendor-specific fallbacks.
+      corresponding jaws; good enough for quick QA drawings, but we'll add vendor-specific
+      fallbacks.
     • **Full 3D ray model**: Not implemented (only pinhole scaling to/from isocenter plane).
-      We'll add an optional physically-accurate projection if needed for dosimetric back-projection.
+      We'll add an optional physically-accurate projection if needed for dosimetric
+      back-projection.
 
     EXTENSION HOOKS (FUTURE TODO)
     ------------------------------
@@ -265,54 +271,56 @@ class RTIMAGE:
 
     # ------------------------------ Initialization ------------------------------
 
-    def __init__(self, rtimg_dataset: pydicom.Dataset):
+    def __init__(self, *args, **kwargs):
         """
+        Initialize an RTIMAGE dataset.
+
         Parameters
         ----------
-        rtimg_dataset : pydicom.Dataset
-            A DICOM RTIMAGE (EPID/portal) dataset. PixelData should be present.
-            Missing geometry tags are tolerated; methods requiring them will raise a
-            clear ValueError (e.g., projection without SID/SAD/spacing).
+        *args, **kwargs
+            Passed directly to :class:`pydicom.dataset.Dataset`.
+
+        Notes
+        -----
+        If initialized from an existing Dataset (e.g. RTIMAGE(ds)), all elements
+        are copied and the core metadata cache is populated.
         """
-        self.rtimg_dataset = rtimg_dataset
+        super().__init__(*args, **kwargs)
         self._meta: Dict[str, Any] = {}
-        self._extract_core_metadata()
 
-    def __getattr__(self, attr: str):
+    @classmethod
+    def from_dataset(cls, ds: Dataset) -> "RTIMAGE":
         """
-        Dot-access passthrough to DICOM keywords (ergonomics like your REG class).
-        If a DICOM keyword exists on the underlying dataset, this returns it; otherwise
-        raises AttributeError.
-        """
-        if attr in self.dir():
-            return getattr(self.rtimg_dataset, attr)
-        raise AttributeError(f"'RTIMAGE' object has no attribute '{attr}'")
+        Create an :class:`RTIMAGE` from an existing DICOM dataset.
 
-    def __setattr__(self, attr: str, value):
+        Parameters
+        ----------
+        ds : pydicom.Dataset
+            A DICOM RTIMAGE (EPID/portal) dataset.
+
+        Returns
+        -------
+        RTIMAGE
+            A new RTIMAGE instance with metadata extracted.
         """
-        Attempts to set a DICOM keyword on the underlying dataset when possible;
-        otherwise sets a normal Python attribute on this wrapper.
-        """
-        if attr == "rtimg_dataset":
-            super().__setattr__(attr, value)
-            return
-        try:
-            tag = pydicom.datadict.tag_for_keyword(attr)
-            if tag is not None:
-                tag_obj = pydicom.tag.Tag(tag)
-                self.rtimg_dataset[tag_obj].value = value
-            else:
-                super().__setattr__(attr, value)
-        except Exception:
-            super().__setattr__(attr, value)
+        rti = cls()
+        rti.update(ds)
+
+        if hasattr(ds, "file_meta"):
+            rti.file_meta = ds.file_meta
+
+        rti._meta = {}
+        rti._extract_core_metadata()
+        return rti
 
     def __dir__(self):
         """
-        Combines Python attributes with keyword names from the wrapped DICOM dataset,
-        enabling tab-completion of tags.
+        Combine Dataset attributes with DICOM keyword names for convenience.
+
+        This preserves normal Dataset behavior and adds keyword-based tab completion.
         """
         base = super().__dir__()
-        kws = [pydicom.datadict.keyword_for_tag(t) for t in self.rtimg_dataset.keys()]
+        kws = [pydicom.datadict.keyword_for_tag(tag) for tag in self.keys()]
         return base + [k for k in kws if k]
 
     def dir(self):
@@ -320,11 +328,10 @@ class RTIMAGE:
         return self.__dir__()
 
     # ------------------------------ Metadata ------------------------------------
-
     def _extract(self, keyword: str, default=None):
         """Safe DICOM keyword getter; returns `default` if missing or unreadable."""
         try:
-            return getattr(self.rtimg_dataset, keyword)
+            return getattr(self, keyword)
         except Exception:
             return default
 
@@ -332,13 +339,14 @@ class RTIMAGE:
         """
         Populate `_meta` with stable, vendor-tolerant fields:
           size: (cols, rows)
-          spacing: (dx, dy) mm/px (priority: ImagePlanePixelSpacing → ImagerPixelSpacing → PixelSpacing)
+          spacing: (dx, dy) mm/px
+            (priority: ImagePlanePixelSpacing → ImagerPixelSpacing → PixelSpacing)
           rtimage: {SID, SAD, Plane, Orientation, Label, Description}
           angles:  {Gantry, Collimator, Table}  (deg; defaults to 0.0 if absent)
           machine: basic identifiers
           link:    Referenced RTPLAN UID and BeamNumber (if present)
         """
-        ds = self.rtimg_dataset
+        ds = self
 
         rows = self._extract("Rows")
         cols = self._extract("Columns")
@@ -404,6 +412,7 @@ class RTIMAGE:
     def get_geometry(self) -> Dict[str, Any]:
         """
         Returns the structured geometry dict assembled in `_extract_core_metadata()`.
+
         Keys are stable; missing elements are `None`.
         """
         return self._meta
@@ -419,10 +428,9 @@ class RTIMAGE:
         • Many EPID images are 16-bit with vendor-specific linear rescaling.
         • Downstream display should call `window_image()` to clamp to [0,1].
         """
-        ds = self.rtimg_dataset
-        arr = ds.pixel_array.astype(np.float32)
-        slope = float(getattr(ds, "RescaleSlope", 1.0))
-        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        arr = self.pixel_array.astype(np.float32)
+        slope = float(getattr(self, "RescaleSlope", 1.0))
+        intercept = float(getattr(self, "RescaleIntercept", 0.0))
         return arr * slope + intercept
 
     def _compute_window(
@@ -436,9 +444,9 @@ class RTIMAGE:
         """
         if window is not None and len(window) == 2:
             return float(window[0]), float(window[1])
-        ds = self.rtimg_dataset
-        wc = getattr(ds, "WindowCenter", None)
-        ww = getattr(ds, "WindowWidth", None)
+
+        wc = getattr(self, "WindowCenter", None)
+        ww = getattr(self, "WindowWidth", None)
 
         def _take(x):
             if isinstance(x, (list, tuple)) and len(x) > 0:
@@ -451,6 +459,7 @@ class RTIMAGE:
         c, w = _take(wc), _take(ww)
         if c is not None and w is not None and w > 0:
             return c, w
+
         lo, hi = np.percentile(img, [5, 95])
         return float((hi + lo) / 2.0), float(max(hi - lo, 1.0))
 
@@ -640,7 +649,10 @@ class RTIMAGE:
 
     @staticmethod
     def _device_by_type(cp: Dataset, dev_type: str) -> Optional[Dataset]:
-        """Find a BeamLimitingDevicePositionSequence item by RTBeamLimitingDeviceType (e.g., 'X','Y','MLCX','MLCY')."""
+        """
+        Find a BeamLimitingDevicePositionSequence item by
+        RTBeamLimitingDeviceType (e.g., 'X','Y','MLCX','MLCY').
+        """
         if "BeamLimitingDevicePositionSequence" not in cp:
             return None
         for d in cp.BeamLimitingDevicePositionSequence:
@@ -746,7 +758,7 @@ class RTIMAGE:
 
         return out
 
-    # ------------------------------ Projection: isocenter plane <-> pixels ------------------------------
+    # ------------------------------ Projection: isocenter plane <-> pixels ----------------
 
     def iso_to_pixels(
         self,
@@ -819,7 +831,7 @@ class RTIMAGE:
         • Converts the 1-based OverlayOrigin (60xx,0050) to 0-based indices for placing into
           the full image canvas.
         """
-        ds = self.rtimg_dataset
+        ds = self
         overlays: List[Dict[str, Any]] = []
         for gg in range(0x6000, 0x601F + 1, 2):
             group = pydicom.tag.Tag(gg, 0x0010)  # Rows tag probe
@@ -968,14 +980,38 @@ class RTIMAGE:
             "Link": self._meta["link"],
         }
 
-    def __contains__(self, key):
-        """True if the underlying dataset has tag `key`."""
-        return key in self.rtimg_dataset
+    def __repr__(self) -> str:
+        """
+        Compact human-readable summary of the RTIMAGE.
 
-    def __getitem__(self, key):
-        """Direct tag access on the underlying dataset (e.g., ds[Tag])."""
-        return self.rtimg_dataset[key]
+        Example:
+            RTIMAGE(size=1024x1024, spacing=0.40x0.40 mm,
+                    SID=1000 mm, SAD=1000 mm,
+                    angles={'Gantry':0.0,'Collimator':0.0,'Table':0.0},
+                    plan_uid=1.2.3.4)
+        """
+        size = self._meta.get("size", (None, None))
+        spacing = self._meta.get("spacing", (None, None))
+        sid = self._meta.get("rtimage", {}).get("SID")
+        sad = self._meta.get("rtimage", {}).get("SAD")
+        ang = self._meta.get("angles", {})
+        link = self._meta.get("link", {})
 
-    def keys(self):
-        """Iterate DICOM tags present on the underlying dataset."""
-        return self.rtimg_dataset.keys()
+        cols, rows = size if size else (None, None)
+        dx, dy = spacing if spacing else (None, None)
+
+        gantry = ang.get("Gantry", None)
+        collimator = ang.get("Collimator", None)
+        table = ang.get("Table", None)
+
+        plan_uid = link.get("ReferencedRTPlanUID", None)
+
+        return (
+            "RTIMAGE("
+            f"size={cols}x{rows}, "
+            f"spacing={dx}x{dy} mm, "
+            f"SID={sid}, SAD={sad}, "
+            f"angles={{Gantry:{gantry}, Collimator:{collimator}, Table:{table}}}, "
+            f"plan_uid={plan_uid}"
+            ")"
+        )
