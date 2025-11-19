@@ -1,11 +1,11 @@
 from typing import Any, Dict, List, Union
 import pandas as pd
 import warnings
-from datetime import datetime
 from pydicom.datadict import dictionary_VR
 from pydicom.multival import MultiValue
 from rosamllib.constants import VR_TO_DTYPE
 from functools import wraps
+from pydicom.valuerep import DA, TM, DT
 
 
 def query_df(df: pd.DataFrame, **filters: Union[str, List[Any], Dict[str, Any]]) -> pd.DataFrame:
@@ -183,7 +183,25 @@ def query_df(df: pd.DataFrame, **filters: Union[str, List[Any], Dict[str, Any]])
     return filtered_df
 
 
-def parse_vr_value(vr, value):
+def _parse_int_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [int(v) for v in value]
+    return int(value)
+
+
+def _parse_float_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [float(v) for v in value]
+    return float(value)
+
+
+def _parse_str_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [str(v) for v in value]
+    return str(value)
+
+
+def parse_vr_value(vr: str, value: Any):
     """
     Parses DICOM tag values based on VR.
 
@@ -191,60 +209,55 @@ def parse_vr_value(vr, value):
     ----------
     vr : str
         The VR of the DICOM tag.
-    value : str
-        The raw value of the DICOM tag.
+    value : Any
+        The raw value of the DICOM tag (string, MultiValue, or already-parsed type).
 
     Returns
     -------
-    Parsed value in the appropriate type (e.g., date, time).
+    Any
+        Parsed value in the appropriate type (e.g., date, time, datetime, int, float, str),
+        or the original value if parsing is not applicable or fails.
     """
-    if value:
-        if vr == "DA":
-            try:
-                return datetime.strptime(value, "%Y%m%d").date()
-            except ValueError:
-                return None
-        elif vr == "TM":
-            try:
-                return datetime.strptime(value, "%H%M%S.%f").time()
-            except ValueError:
-                try:
-                    return datetime.strptime(value, "%H%M%S").time()
-                except ValueError:
-                    return None
-        elif vr == "DT":
-            try:
-                return datetime.strptime(value, "%Y%m%d%H%M%S.%f")
-            except ValueError:
-                try:
-                    return datetime.strptime(value, "%Y%m%d%H%M%S")
-                except ValueError:
-                    return None
-        elif vr in ["IS", "SL", "SS", "UL", "US"]:
-            try:
-                if isinstance(value, MultiValue):
-                    return [int(v) for v in value]
-                else:
-                    return int(value)
-            except ValueError:
-                return None
-        elif vr in ["DS", "FL", "FD"]:
-            try:
-                if isinstance(value, MultiValue):
-                    return [float(v) for v in value]
-                else:
-                    return float(value)
-            except ValueError:
-                return None
-        elif vr == "LO":
-            try:
-                if isinstance(value, MultiValue):
-                    return [str(v) for v in value]
-                else:
-                    return str(value)
-            except ValueError:
-                return None
+    # Treat None / emtpy string as-is
+    if value in (None, "", b""):
+        return value
 
+    # Already-parsed pydicom VRs -> convert to Python's stdlib types
+    if isinstance(value, (DA, TM, DT)):
+        return value
+
+    # Handle string / MultiValue cases explicitly by VR
+    try:
+        if vr == "DA":
+            # DICOM DA is always YYYYMMDD
+            if isinstance(value, MultiValue):
+                return [DA(v) for v in value]
+            return DA(value)
+
+        elif vr == "TM":
+            if isinstance(value, MultiValue):
+                return [TM(v) for v in value]
+            return TM(value)
+
+        elif vr == "DT":
+            if isinstance(value, MultiValue):
+                return [DT(v) for v in value]
+            return DT(value)
+
+        elif vr in ["IS", "SL", "SS", "UL", "US"]:
+            return _parse_int_like(value)
+
+        elif vr in ["DS", "FL", "FD"]:
+            return _parse_float_like(value)
+
+        elif vr == "LO":
+            return _parse_str_like(value)
+
+    except Exception:
+        # If any of the parsing steps above fails, fall back to original value
+        return None
+
+    # Default: return original value untouched
     return value
 
 
