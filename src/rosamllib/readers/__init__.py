@@ -6,4 +6,5 @@ from rosamllib.readers.dicom_raw_reader import DICOMRawReader
 from rosamllib.readers.plan_reader import RTPlanReader
 from rosamllib.readers.record_reader import RTRecordReader
 from rosamllib.readers.seg_reader import SEGReader
+from rosamllib.readers.rtimage_reader import RTImageReader
 from rosamllib.readers.dicom_loader import DICOMLoader

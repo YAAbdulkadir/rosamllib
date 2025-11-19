@@ -6,6 +6,18 @@ from rosamllib.utils.dicom_utils import (
     validate_dicom_path,
     compute_dvh,
 )
+from rosamllib.utils.dicom_node_utils import (
+    get_referenced_nodes,
+    get_referencing_nodes,
+    get_frame_registered_nodes,
+    get_nodes_for_patient,
+    associate_dicoms,
+    relink_raw_series_for_patient,
+    relink_raw_series_after_load,
+    _norm_modalities,
+    _level_ok,
+    _modality_ok,
+)
 from rosamllib.utils.networking_utils import (
     validate_ae_title,
     validate_entry,
