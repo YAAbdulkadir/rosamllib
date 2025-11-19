@@ -3,8 +3,8 @@ import time
 import logging
 import pandas as pd
 from logging import StreamHandler, FileHandler, Formatter, Handler
-from typing import List, Dict, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Optional, Union
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from collections import deque
 from pydicom.tag import Tag, BaseTag
@@ -42,12 +42,28 @@ _DEFAULT_TS = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
 
 @dataclass
 class MoveResult:
-    status: int
+    status: Optional[int]
     completed: int = 0
     failed: int = 0
     warning: int = 0
     remaining: int = 0
     error_comment: Optional[str] = None
+
+
+@dataclass
+class FindResult:
+    status: Optional[int] = None
+    matches: List[Dataset] = field(default_factory=list)
+    error_comment: Optional[str] = None
+
+    def __len__(self):
+        return len(self.matches)
+
+    def __getitem__(self, indx):
+        return self.matches[indx]
+
+    def __contains__(self, item):
+        return item in self.matches
 
 
 class QueryRetrieveSCU:
@@ -262,7 +278,7 @@ class QueryRetrieveSCU:
             if not assoc:
                 self.logger.error("Failed to associate.", extra=extra)
                 return False
-            self._log_accepted_contexts_debug(assoc)
+            self.log_accepted_contexts(assoc)
             self.logger.info("Association established. Sending C-ECHO...", extra=extra)
             status = assoc.send_c_echo()
             extra["status_hex"] = hex(getattr(status, "Status", 0xFFFF))
@@ -274,54 +290,86 @@ class QueryRetrieveSCU:
                 self.logger.error(f"C-ECHO failed. Status={status}", extra=extra)
                 return False
 
-    def c_find(self, ae_name: str, query: Dataset) -> Optional[List[Dataset]]:
+    def c_find(self, ae_name: str, query: Dataset) -> FindResult:
         """Perform a C-FIND request using the provided query Dataset."""
         extra = self._op_ctx(ae_name, "C-FIND", dataset=query)
         t0 = time.perf_counter()
+
+        result = FindResult()
+
         with self.association_context(ae_name) as assoc:
             if not assoc:
-                self.logger.error("Failed to associate.", extra=extra)
-                return None
-            self._log_accepted_contexts_debug(assoc)
+                msg = f"Failed to associate with AE '{ae_name}'."
+                self.logger.error(msg, extra=extra)
+                result.error_comment = msg
+                extra["status_hex"] = None
+                extra["matches"] = 0
+                extra["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+                return result
+
+            self.log_accepted_contexts(assoc)
             self.logger.info("Association established. Sending C-FIND...", extra=extra)
 
-            results: List[Dataset] = []
+            matches: List[Dataset] = []
             last_status = None
+
+            # results: List[Dataset] = []
+            # last_status = None
             responses = assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
             for status, identifier in responses:
                 last_status = status
                 if status and status.Status in (0xFF00, 0xFF01):  # Pending
                     if identifier is not None:
-                        results.append(identifier)
+                        matches.append(identifier)
 
-            extra["status_hex"] = (
-                hex(getattr(last_status, "Status", 0xFFFF)) if last_status else None
-            )
-            extra["matches"] = len(results)
+            result.matches = matches
+            if last_status is not None:
+                result.status = getattr(last_status, "Status", None)
+                if hasattr(last_status, "ErrorComment"):
+                    result.error_comment = str(last_status.ErrorComment)
+
+            extra["status_hex"] = hex(result.status) if result.status is not None else None
+            extra["matches"] = len(matches)
             extra["duration_ms"] = int((time.perf_counter() - t0) * 1000)
 
-            if last_status and last_status.Status == 0x0000:
-                self.logger.info(f"C-FIND completed: {len(results)} matches.", extra=extra)
+            if result.status == 0x0000:
+                self.logger.info(f"C-FIND completed: {len(matches)} matches.", extra=extra)
             else:
                 self.logger.warning(
-                    f"C-FIND finished with status={last_status}; matches={len(results)}.",
+                    f"C-FIND finished with status={last_status}; matches={len(matches)}.",
                     extra=extra,
                 )
-            return results
 
-    def c_move(self, ae_name: str, query: Dataset, destination_ae: str):
+            return result
+
+    def c_move(self, source_ae: str, query: Dataset, destination_ae: str) -> MoveResult:
         """Perform a C-MOVE request to move studies to a specified AE."""
-        extra = self._op_ctx(ae_name, "C-MOVE", dataset=query, destination_ae=destination_ae)
+        extra = self._op_ctx(source_ae, "C-MOVE", dataset=query, destination_ae=destination_ae)
         t0 = time.perf_counter()
-        with self.association_context(ae_name) as assoc:
+        result = MoveResult(status=None)
+
+        with self.association_context(source_ae) as assoc:
             if not assoc:
-                self.logger.error("Failed to associate.", extra=extra)
-                return None
-            self._log_accepted_contexts_debug(assoc)
+                msg = f"Failed to associate with AE '{source_ae}."
+                self.logger.error(msg, extra=extra)
+                result.error_comment = msg
+                extra.update(
+                    {
+                        "status_hex": None,
+                        "completed": result.completed,
+                        "failed": result.failed,
+                        "warning": result.warning,
+                        "remaining": result.remaining,
+                        "duration_ms": int((time.perf_counter() - t0) * 1000),
+                    }
+                )
+                return result
+            self.log_accepted_contexts(assoc)
             self.logger.info(
                 f"Association established. Sending C-MOVE to '{destination_ae}'...", extra=extra
             )
-            result = MoveResult(status=0xFFFF)
+            result.status = 0xFFF
+
             for status, _ in assoc.send_c_move(
                 query, destination_ae, StudyRootQueryRetrieveInformationModelMove
             ):
@@ -382,7 +430,7 @@ class QueryRetrieveSCU:
                 # self.logger.error(f"Failed to associate with {ae_name}.")
                 self.logger.error("Failed to associate.", extra=extra)
                 return None
-            self._log_accepted_contexts_debug(assoc)
+            self.log_accepted_contexts(assoc)
 
             # Guard: ensure peer accepted the Storage PC we need
             accepted = any(
@@ -391,7 +439,7 @@ class QueryRetrieveSCU:
             if not accepted:
                 acc_list = [
                     (pc.abstract_syntax.name, [str(ts) for ts in pc.transfer_syntax])
-                    for pc in assoc.accpeted_contexts
+                    for pc in assoc.accepeted_contexts
                 ]
                 self.logger.error(
                     "No accepted Storage presentation context for SOP Class.",
@@ -411,8 +459,35 @@ class QueryRetrieveSCU:
             return status
 
     @staticmethod
-    def convert_results_to_df(results, query_dataset):
-        if not results:
+    def convert_results_to_df(
+        results: Union[List[Dataset] | FindResult], query_dataset: Dataset
+    ) -> pd.DataFrame:
+        """
+        Convert C-FIND results to a pandas DataFrame.
+
+        Parameters
+        ----------
+        results :
+            Either:
+            - Iterable of pydicom.Dataset (old behavior), or
+            - An object with a `.matches` attribute (e.g., FindResult) containing the list of
+            Datasets.
+        query_dataset : Dataset
+            The original C-FIND query dataset.
+
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame with one row per match. Columns include:
+            - All attributes requested in `query_dataset` (by keyword where possible)
+            - Any additional attributes present in the result datasets.
+        """
+        if hasattr(results, "matches"):
+            matches = getattr(results, "matches")
+        else:
+            matches = results
+
+        if not matches:
             # Return empty DF with columns matching requested keys (by keyword where possible)
             cols = []
             for tag in query_dataset.keys():
@@ -420,7 +495,7 @@ class QueryRetrieveSCU:
                 cols.append(kw if kw else int(tag))
             return pd.DataFrame(columns=cols)
 
-        metadata_list = [QueryRetrieveSCU._get_metadata(r, query_dataset) for r in results]
+        metadata_list = [QueryRetrieveSCU._get_metadata(r, query_dataset) for r in matches]
         df = pd.DataFrame(metadata_list)
 
         for col in df.columns:
@@ -430,15 +505,18 @@ class QueryRetrieveSCU:
                 if isinstance(col, (int, BaseTag)):
                     vr = dictionary_VR(Tag(col))
                 else:
-                    vr = dictionary_VR(Tag(tag_for_keyword(col)))
+                    tag = tag_for_keyword(col)
+                    if tag is not None:
+                        vr = dictionary_VR(Tag(tag))
             except (KeyError, TypeError, ValueError):
                 vr = None
 
             dtype = VR_TO_DTYPE.get(vr, object)
             if dtype == "date":
-                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
             elif dtype == "time":
-                df[col] = pd.to_datetime(df[col], format="%H:%M:%S", errors="coerce").dt.time
+                # df[col] = pd.to_datetime(df[col], format="%H:%M:%S", errors="coerce").dt.time
+                pass
             elif dtype == "datetime":
                 df[col] = pd.to_datetime(df[col], errors="coerce")
             else:
@@ -450,12 +528,25 @@ class QueryRetrieveSCU:
         return df
 
     @staticmethod
-    def _get_metadata(result_dataset, query_dataset):
-        md = {}
-        for tag in list(query_dataset.keys()):
+    def _get_metadata(result_dataset: Dataset, query_dataset: Dataset) -> Dict:
+        """
+        Build a metadata dict for a sinlge C-FIND result.
+
+        Includes both:
+            - Tags present in the query_dataset
+            - Any extra tags present in result_dataset
+        """
+        md: Dict = {}
+
+        # Union of tags from query and result
+        all_tags = set(query_dataset.keys()) | set(result_dataset.keys())
+
+        # for tag in list(query_dataset.keys()):
+        for tag in all_tags:
             vr = dictionary_VR(tag)
             value = result_dataset[tag].value if tag in result_dataset else None
             key = keyword_for_tag(tag) or int(tag)
+
             if isinstance(value, Sequence) and vr == "SQ":
                 try:
                     # pydicom 3.0+: Dataset.json() exists; else fallback
@@ -529,7 +620,7 @@ class QueryRetrieveSCU:
         self,
         log_to_console: bool = True,
         log_to_file: bool = False,
-        log_file_path: str = "store_scp.log",
+        log_file_path: str = "qr_scu.log",
         log_level: int = logging.INFO,
         formatter: Optional[Formatter] = None,
         json_logs: bool = False,
@@ -555,7 +646,7 @@ class QueryRetrieveSCU:
 
         Returns
         -------
-        Dict[str, logging.Handlers]
+        Dict[str, logging.Handler]
             The handlers that were added, keyed by "console" and/or "file".
         """
         # formatter
@@ -645,14 +736,3 @@ class QueryRetrieveSCU:
                 h.close()
             finally:
                 self.logger.removeHandler(h)
-
-    def _log_accepted_contexts_debug(self, assoc):
-        """Emit accepted PCs at DEBUG level (handy for diagnosing rejections)."""
-        if not self.logger.isEnabledFor(logging.DEBUG) or not assoc:
-            return
-        lines = []
-        for pc in assoc.accepted_contexts:
-            ts_list = ", ".join(str(ts) for ts in pc.transfer_syntax)
-            lines.append(f"{pc.abstract_syntax.name} [{ts_list}]")
-        if lines:
-            self.logger.debug("Accepted presentation contexts:\n  - " + "\n  - ".join(lines))
