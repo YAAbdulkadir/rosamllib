@@ -1,6 +1,8 @@
+from io import BytesIO
 import os
 import copy
 import time
+import graphviz
 import numpy as np
 import SimpleITK as sitk
 import matplotlib.pyplot as plt
@@ -8,6 +10,7 @@ import warnings
 import plotly.graph_objects as go
 from rosamllib.dicoms import DICOMImage
 from rosamllib.utils import compute_dvh
+import matplotlib.image as mpimg
 
 
 def in_jupyter():
@@ -1024,3 +1027,575 @@ def dvh_viewer(
         fig.show(renderer=renderer)
 
     plot_dvh(relative_volume, relative_dose)
+
+
+def visualize_series_references(
+    patient,
+    output_file=None,
+    view=True,
+    exclude_modalities=None,
+    exclude_series=None,
+    include_uid=False,
+    rankdir="BT",
+    *,
+    output_format: str = "svg",
+    return_graph: str = "none",
+):
+    """
+    Visualize series-level associations for a single patient using Graphviz.
+
+    Each series is represented as a box, and edges are drawn from a series (or instance)
+    to the series/instance it references. The patient node sits at the top, with study
+    subgraphs grouping series. Embedded RAW contents are shown as nested subgraphs.
+
+    Parameters
+    ----------
+    patient : PatientNode
+        The patient object to visualize. (Pass exactly one patient.)
+    output_file : str or None, optional
+        If provided, saves the rendered graph to '{output_file}_{patient.PatientID}.{ext}'.
+        Use `output_format` to choose the file format. If None, nothing is written.
+    view : bool, optional
+        Whether to display the graph after generation. In Jupyter, shows SVG inline;
+        otherwise opens a Matplotlib window with a PNG rendering.
+    per_patient : bool, optional
+        (Reserved; not used when a single `patient` object is passed. Kept for API compatibility.)
+    exclude_modalities : list[str] or str or None, optional
+        Modalities to exclude (e.g., ["RTRECORD", "RAW"]). If a string is supplied, it
+        is treated as a single-item list.
+    exclude_series : list[str] or None, optional
+        SeriesInstanceUIDs to exclude from the graph.
+    include_uid : bool, optional
+        If True, node labels include (SOP/Series)InstanceUIDs.
+    rankdir : {'RL','LR','BT','TB'}, optional
+        Graph layout direction (default: 'BT' = bottom-to-top).
+    output_format : {'svg','png'}, keyword-only, optional
+        File format used when writing to disk (via `output_file`). Default: 'svg'.
+    return_graph : {'none','graph','dot','svg','png'}, keyword-only, optional
+        Controls what the function returns:
+        - 'none'  : return None
+        - 'graph' : return the graphviz.Digraph object
+        - 'dot'   : return the DOT source string (str)
+        - 'svg'   : return SVG bytes
+        - 'png'   : return PNG bytes
+
+    Returns
+    -------
+    object or bytes or str or None
+        Depending on `return_graph`:
+        - 'none'  -> None
+        - 'graph' -> graphviz.Digraph
+        - 'dot'   -> str (DOT)
+        - 'svg'   -> bytes (SVG)
+        - 'png'   -> bytes (PNG)
+    """
+    if rankdir not in ["RL", "LR", "BT", "TB"]:
+        raise ValueError(f"{rankdir} is not a valid option for rankdir")
+    if output_format not in {"svg", "png"}:
+        raise ValueError("output_format must be 'svg' or 'png'")
+    if return_graph not in {"none", "graph", "dot", "svg", "png"}:
+        raise ValueError("return_graph must be one of {'none','graph','dot','svg','png'}")
+
+    if isinstance(exclude_modalities, str):
+        exclude_modalities = [exclude_modalities]
+    if isinstance(exclude_series, str):
+        exclude_series = [exclude_series]
+    exclude_series = set(exclude_series or [])
+
+    # define color mappings based on modality
+    modality_colors = {
+        "CT": "lightsteelblue",
+        "MR": "lightseagreen",
+        "PT": "lightcoral",
+        "RTSTRUCT": "navajowhite",
+        "RTPLAN": "lightgoldenrodyellow",
+        "RTDOSE": "lightpink",
+        "RTRECORD": "lavender",
+        "REG": "thistle",
+        "SEG": "peachpuff",
+        "RTIMAGE": "lightcyan",
+        "DEFAULT": "lightgray",
+    }
+    patient_color = "dodgerblue"
+    raw_subgraph_color = "lightcyan"
+
+    def study_color_generator():
+        study_subgraph_colors = [
+            "honeydew",
+            "lavenderblush",
+            "azure",
+            "seashell",
+            "mintcream",
+            "mistyrose",
+            "aliceblue",
+            "powderblue",
+            "oldlace",
+        ]
+        while True:
+            for color in study_subgraph_colors:
+                yield color
+
+    def get_modality_color(modality):
+        """
+        Helper function to get the background color based on the modality.
+        """
+        return modality_colors.get(modality, modality_colors["DEFAULT"])
+
+    def get_referenced_series(series):
+        referenced_series = list()
+        for sop_uid, instance in series.instances.items():
+            if instance.referenced_sids:
+                for ref_sid in instance.referenced_sids:
+                    parent_dataset = (
+                        instance.parent_series.parent_study.parent_patient.parent_dataset
+                    )
+                    ref_series = parent_dataset.find_series(ref_sid)
+                    if ref_series:
+                        referenced_series.append(ref_series)
+
+        return referenced_series
+
+    def get_other_referenced_series(series):
+        referenced_series = list()
+        for sop_uid, instance in series.instances.items():
+            if instance.other_referenced_sids:
+                for ref_sid in instance.other_referenced_sids:
+                    parent_dataset = (
+                        instance.parent_series.parent_study.parent_patient.parent_dataset
+                    )
+                    ref_series = parent_dataset.find_series(ref_sid)
+                    if ref_series:
+                        referenced_series.append(ref_series)
+
+        return referenced_series
+
+    def get_frame_registered_image_series(series):
+        referenced_series = set()
+        for series in series.frame_of_reference_registered:
+            if series.Modality in ["CT", "MR", "PT"]:
+                referenced_series.add(series)
+        return referenced_series
+
+    def exclude_referenced(
+        series, exclude_modalities=exclude_modalities, exclude_series=exclude_series
+    ):
+        if exclude_modalities and series.Modality in exclude_modalities:
+            return True
+        if exclude_series and series.SeriesInstanceUID in exclude_series:
+            return True
+        return False
+
+    def create_graph(patient, graph):
+        """
+        Helper function to create a graph for a specific patient.
+        """
+        # Add patient ID as the top node for each patient's graph
+        patient_id = patient.PatientID
+        patient_name = patient.PatientName
+        graph.node(
+            patient_id,
+            label=(f"Patient ID: {patient_id}\n{patient_name}"),
+            fillcolor=patient_color,
+            style="filled",
+        )
+
+        # for each group draw subgraph
+        all_nodes_set = set()
+        referencing_nodes_set = set()
+        color_cycle = study_color_generator()
+
+        # first pass: create nodes only
+        for study in patient:
+            study_uid = study.StudyInstanceUID
+            grouped = study.series
+            first_sid = next(iter(grouped))
+            first_series = grouped[first_sid]
+            study_desc = first_series.StudyDescription
+            ct_mr_pt_nodes = []
+            with graph.subgraph(name=f"cluster_{study_uid}") as study_graph:
+                if include_uid:
+                    label_rg = f"StudyDescription: {study_desc}" f"\nStudyInstanceUID: {study_uid}"
+
+                else:
+                    label_rg = f"StudyDescription: {study_desc}"
+
+                label_loc = "b" if rankdir == "BT" else "t"
+                # label_loc = "t"
+                study_subgraph_color = next(color_cycle)
+                study_graph.attr(
+                    label=label_rg,
+                    labelloc=label_loc,
+                    color="black",
+                    style="filled",
+                    fillcolor=study_subgraph_color,
+                )
+                for series_uid, series in grouped.items():
+
+                    # Exclude modalities if specified
+                    if exclude_modalities and series.Modality in exclude_modalities:
+                        continue
+
+                    if series.SeriesInstanceUID in exclude_series:
+                        continue
+
+                    if series.Modality == "RAW":
+                        continue
+
+                    if exclude_modalities and "RAW" in exclude_modalities:
+                        if series.is_embedded_in_raw:
+                            continue
+
+                    if series.Modality in ["CT", "MR", "PT"]:
+                        ct_mr_pt_nodes.append(series.SeriesInstanceUID)
+
+                    # get the color based on modality
+                    node_color = get_modality_color(series.Modality)
+
+                    # handle embedded series in RAW
+                    if series.is_embedded_in_raw:
+                        # create another subgraph for the embedded series within the RAW series
+                        with study_graph.subgraph(
+                            name=f"cluster_{series.raw_series_reference.SeriesInstanceUID}"
+                        ) as raw_graph:
+                            if include_uid:
+                                label_r = (
+                                    f"MIM Session: "
+                                    f"{series.raw_series_reference.SeriesDescription}"
+                                    "\nSeriesInstanceUID: "
+                                    f"{series.raw_series_reference.SeriesInstanceUID}"
+                                )
+                            else:
+                                label_r = (
+                                    "MIM Session: "
+                                    f"{series.raw_series_reference.SeriesDescription}"
+                                )
+                            raw_graph.attr(
+                                label=label_r,
+                                color="black",
+                                style="filled",
+                                fillcolor=raw_subgraph_color,
+                            )
+
+                            # If it's an RT-like series, create *instance* nodes
+                            if series.Modality in [
+                                "RTSTRUCT",
+                                "RTPLAN",
+                                "RTDOSE",
+                                "RTRECORD",
+                                "SEG",
+                            ]:
+                                for sop_uid, instance in series.instances.items():
+                                    # italicize the embedded instance
+                                    if include_uid:
+                                        label = (
+                                            f"{series.Modality}: {series.SeriesDescription}"
+                                            f"\n{sop_uid}"
+                                        )
+                                    else:
+                                        label = f"{series.Modality}: {series.SeriesDescription}"
+                                    raw_graph.node(
+                                        sop_uid,
+                                        label=label,
+                                        shape="box",
+                                        style="filled",
+                                        fontcolor="black",
+                                        fontname="Times-Italic",
+                                        fillcolor=node_color,
+                                    )
+                                    all_nodes_set.add(sop_uid)
+                            else:
+                                # Non-RT embedded series still get a single series-level node
+
+                                # italicize the embedded series
+                                if include_uid:
+                                    label = (
+                                        f"{series.Modality}: {series.SeriesDescription}"
+                                        f"\n{series.SeriesInstanceUID}"
+                                    )
+                                else:
+                                    label = f"{series.Modality}: {series.SeriesDescription}"
+                                raw_graph.node(
+                                    series.SeriesInstanceUID,
+                                    label=label,
+                                    shape="box",
+                                    style="filled",
+                                    fontcolor="black",
+                                    fontname="Times-Italic",
+                                    fillcolor=node_color,
+                                )
+                                all_nodes_set.add(series.SeriesInstanceUID)
+                    else:
+                        if series.Modality in [
+                            "RTSTRUCT",
+                            "RTPLAN",
+                            "RTDOSE",
+                            "RTRECORD",
+                            "SEG",
+                        ]:
+                            # Add each instance separately as a node
+                            for sop_uid, instance in series.instances.items():
+                                if include_uid:
+                                    label = (
+                                        f"{series.Modality}: {series.SeriesDescription}"
+                                        f"\nSOPInstanceUID: {sop_uid}"
+                                    )
+                                else:
+                                    label = f"{series.Modality}: {series.SeriesDescription}"
+                                node_color = get_modality_color(series.Modality)
+                                study_graph.node(
+                                    sop_uid,
+                                    label=label,
+                                    style="filled",
+                                    fillcolor=node_color,
+                                )
+                                all_nodes_set.add(sop_uid)
+
+                        else:
+                            # Add each series as a node (box)
+                            if include_uid:
+                                label = (
+                                    f"{series.Modality}: {series.SeriesDescription}"
+                                    f"\nSeriesInstanceUID: {series.SeriesInstanceUID}"
+                                )
+                            else:
+                                label = f"{series.Modality}: {series.SeriesDescription}"
+                            node_color = get_modality_color(series.Modality)
+                            study_graph.node(
+                                series.SeriesInstanceUID,
+                                label=label,
+                                style="filled",
+                                fillcolor=node_color,
+                            )
+                            all_nodes_set.add(series.SeriesInstanceUID)
+
+                # Enforce same rank for CT, MR, PT
+                if ct_mr_pt_nodes:
+                    with study_graph.subgraph() as same_rank:
+                        same_rank.attr(rank="same")
+                        for node in ct_mr_pt_nodes:
+                            same_rank.node(node)
+        # second pass: add edges based on references
+        for study in patient:
+            study_uid = study.StudyInstanceUID
+            grouped = study.series
+            if study_uid is not None:
+                for series_uid, series in grouped.items():
+                    # Exclude modalities if specified
+                    if exclude_modalities and series.Modality in exclude_modalities:
+                        continue
+
+                    if series.SeriesInstanceUID in exclude_series:
+                        continue
+
+                    if series.Modality == "RAW":
+                        continue
+
+                    if exclude_modalities and "RAW" in exclude_modalities:
+                        if series.is_embedded_in_raw:
+                            continue
+
+                    if series.Modality in [
+                        "RTSTRUCT",
+                        "RTPLAN",
+                        "RTDOSE",
+                        "RTRECORD",
+                        "SEG",
+                    ]:
+                        # Add each instance separately as a node
+                        for sop_uid, instance in series.instances.items():
+                            # Check for direct references to other nodes
+                            if series.Modality in ["RTSTRUCT", "SEG"]:
+                                referenced_series_list = instance.referenced_series
+                                if referenced_series_list:
+                                    for referenced_series in referenced_series_list:
+                                        if not exclude_referenced(referenced_series):
+                                            referencing_nodes_set.add(instance.SOPInstanceUID)
+
+                                            # Draw an edge pointing *upwards* from the
+                                            # referenced node to the referencing node
+                                            graph.edge(
+                                                instance.SOPInstanceUID,
+                                                referenced_series.SeriesInstanceUID,
+                                            )
+                                else:
+                                    # Check for FrameOfReference registeration
+                                    if series.frame_of_reference_registered:
+                                        for (
+                                            frame_of_ref_series
+                                        ) in series.frame_of_reference_registered:
+                                            if frame_of_ref_series.Modality in [
+                                                "CT",
+                                                "MR",
+                                                "PT",
+                                            ]:
+                                                if not exclude_referenced(frame_of_ref_series):
+                                                    referencing_nodes_set.add(
+                                                        instance.SOPInstanceUID
+                                                    )
+
+                                                    graph.edge(
+                                                        instance.SOPInstanceUID,
+                                                        frame_of_ref_series.SeriesInstanceUID,
+                                                        style="dashed",
+                                                    )
+                                                    break
+                            else:
+                                referenced_instances_list = instance.referenced_instances
+                                if referenced_instances_list:
+                                    for referenced_instance in referenced_instances_list:
+                                        if not exclude_referenced(
+                                            referenced_instance.parent_series
+                                        ):
+                                            referencing_nodes_set.add(instance.SOPInstanceUID)
+
+                                            # Draw an edge pointing *upwards* from the
+                                            # referenced node to the referencing node
+                                            graph.edge(
+                                                instance.SOPInstanceUID,
+                                                referenced_instance.SOPInstanceUID,
+                                            )
+                                else:
+                                    # Check if FrameOfReference registration
+                                    if series.frame_of_reference_registered:
+                                        for (
+                                            frame_of_ref_series
+                                        ) in series.frame_of_reference_registered:
+                                            if frame_of_ref_series.Modality in [
+                                                "CT",
+                                                "MR",
+                                                "PT",
+                                            ]:
+                                                if not exclude_referenced(frame_of_ref_series):
+                                                    referencing_nodes_set.add(
+                                                        instance.SOPInstanceUID
+                                                    )
+                                                    graph.edge(
+                                                        instance.SOPInstanceUID,
+                                                        frame_of_ref_series.SeriesInstanceUID,
+                                                        style="dashed",
+                                                    )
+                                                    break
+                    else:
+                        # Check if the series references another series directly
+                        referenced_series_set = get_referenced_series(series)
+                        if referenced_series_set:
+                            referenced_series = referenced_series_set[0]
+                            if not exclude_referenced(referenced_series):
+                                referenced_series_uid = referenced_series.SeriesInstanceUID
+                                referencing_nodes_set.add(series.SeriesInstanceUID)
+
+                                # Draw an edge pointing *upwards* from the referenced series
+                                # to the referencing series
+                                graph.edge(
+                                    series.SeriesInstanceUID,
+                                    referenced_series_uid,
+                                )
+                        else:
+                            # Check if the series references other instances directly
+                            referenced_instances = patient.get_referenced_nodes(
+                                series, level="INSTANCE", recursive=False
+                            )
+                            if referenced_instances:
+                                for ref_inst in referenced_instances:
+                                    if not exclude_referenced(ref_inst.parent_series):
+                                        referencing_nodes_set.add(ref_inst.SOPInstanceUID)
+
+                                        # Draw an edge pointing *upwards* from the
+                                        # referenced node to the referencing node
+                                        graph.edge(
+                                            series.SeriesInstanceUID,
+                                            ref_inst.SOPInstanceUID,
+                                        )
+
+                        # Check for REG modality and moving image reference
+                        # (other_referenced_sid)
+                        if series.Modality == "REG":
+                            other_referenced_series_set = get_other_referenced_series(series)
+                            if other_referenced_series_set:
+                                other_referenced_series = other_referenced_series_set[0]
+                                if not exclude_referenced(other_referenced_series):
+                                    referencing_nodes_set.add(series.SeriesInstanceUID)
+                                    # Draw a dashed blue edge for the REG moving image
+                                    # reference
+                                    graph.edge(
+                                        series.SeriesInstanceUID,
+                                        other_referenced_series.SeriesInstanceUID,
+                                        style="dotted",
+                                    )
+
+        # Root nodes are those that don't reference other series
+        root_nodes = all_nodes_set - referencing_nodes_set
+
+        # Connect the patient node to the root series nodes
+        for root in root_nodes:
+            graph.edge(
+                root, patient_id, style="invis"
+            )  # Root points to the patient (arrows go up)
+
+        return graph
+
+    def display_graph_with_matplotlib(dot_source, dpi=1000):
+        """
+        Displays the Graphviz graph using matplotlib, by converting SVG to PNG.
+        """
+        # Generate the PNG in memory
+        graph_svg = graphviz.Source(dot_source)
+        png_data = graph_svg.pipe(format="png")
+
+        # Load the PNG into a Matplotlib plot
+        img = mpimg.imread(BytesIO(png_data), format="png")
+
+        # Display the PNG using matplotlib
+        plt.figure(figsize=(12, 12), dpi=dpi)  # Adjust figure size for large graphs
+        plt.imshow(img)
+        plt.axis("off")
+        plt.show()
+
+    def display_graph_in_jupyter(dot_source):
+        """
+        Displays the graph inline in a Jupyter notebook using IPython's display and SVG.
+        """
+        from IPython.display import display, SVG
+
+        graph_svg = graphviz.Source(dot_source)
+        svg = graph_svg.pipe(format="svg").decode("utf-8")
+        display(SVG(svg))
+
+    is_jupyter = in_jupyter()
+
+    patient_id = patient.PatientID
+
+    from rosamllib.utils import get_nodes_for_patient
+
+    all_series = get_nodes_for_patient(patient)
+    if not all_series:
+        print(f"No data found for patient {patient_id}")
+        return
+    graph = graphviz.Digraph(comment=f"DICOM Series Associations for {patient_id}")
+    graph.attr("node", shape="box", style="filled", fillcolor="lightgray", color="black")
+    graph.attr(rankdir=rankdir)
+
+    # Create a graph for the specified patient
+    graph = create_graph(patient, graph)
+
+    # Render and view the graph for the specified patient
+    if output_file:
+        graph.render(f"{output_file}.{output_format}", format=output_format)
+
+    if view:
+        if is_jupyter:
+            display_graph_in_jupyter(graph.source)
+        else:
+            display_graph_with_matplotlib(graph.source)
+
+    # Return as requested
+    if return_graph == "none":
+        return None
+    if return_graph == "graph":
+        return graph
+    if return_graph == "dot":
+        return graph.source
+    if return_graph in {"svg", "png"}:
+        return graph.pipe(format=return_graph)
+
+    return None
