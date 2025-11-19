@@ -8,27 +8,42 @@ from rosamllib.dicoms import REG
 
 class REGReader:
     """
-    A class for reading DICOM REG files from a file path, directory, or pydicom.Dataset.
-    The REGReader class will return an instance of the REG class, which contains methods
-    for extracting transformation matrices, metadata, and referenced series information.
+    Reader class for loading DICOM Registration (REG) objects from disk or an
+    already-loaded :class:`pydicom.Dataset`.
+
+    The reader accepts either:
+
+    - A file path to a REG DICOM file.
+    - A directory containing at least one REG file.
+    - A pre-loaded :class:`pydicom.Dataset` whose modality is ``"REG"``.
+
+    The :meth:`read` method returns an instance of :class:`rosamllib.dicoms.REG`,
+    which is a subclass of :class:`pydicom.Dataset` with additional
+    registration-specific utilities for parsing rigid/deformable registration
+    information, transformation matrices, and referenced image metadata.
 
     Parameters
     ----------
-    reg_input : str or pydicom.Dataset
-        Path to the REG file, directory containing a REG file, or a pydicom.Dataset.
-
-    Methods
-    -------
-    read()
-        Reads the REG file or dataset and returns an instance of the REG class.
+    reg_input : str, pathlib.Path, or pydicom.Dataset
+        A path to a REG file, a directory containing a REG file, or an
+        in-memory DICOM dataset.
 
     Examples
     --------
-    >>> reader = REGReader("path/to/dicom/REG")
+    Reading from a file path:
+
+    >>> reader = REGReader("path/to/REG.dcm")
     >>> reg = reader.read()
 
-    >>> dataset = pydicom.dcmread("path/to/dicom/REG.dcm")
-    >>> reader = REGReader(dataset)
+    Reading from a directory:
+
+    >>> reader = REGReader("/path/to/folder/")
+    >>> reg = reader.read()
+
+    Reading from an existing dataset:
+
+    >>> ds = pydicom.dcmread("path/to/REG.dcm")
+    >>> reader = REGReader(ds)
     >>> reg = reader.read()
     """
 
@@ -49,21 +64,27 @@ class REGReader:
 
     def read(self):
         """
-        Reads the REG file or dataset and returns an instance of the REG class.
+        Load the REG file or dataset and return an initialized :class:`REG` object.
 
-        If a file path is provided, it reads the file or searches for a REG file
-        in the directory. If a dataset is provided, it directly instantiates the REG class.
+        If ``reg_input`` was a directory, the reader searches recursively for the
+        first valid file with DICOM Modality ``REG``.
+        If ``reg_input`` was already a :class:`pydicom.Dataset`, it is used as is.
 
         Returns
         -------
         REG
-            An instance of the REG class, initialized with the DICOM REG dataset.
+            A :class:`REG` instance created via :meth:`REG.from_dataset`,
+            containing all DICOM elements along with parsed registration
+            metadata and transformation structures.
 
         Raises
         ------
         IOError
-            If no REG file is found in the directory or if the file cannot be read.
+            If no REG file can be located when a directory is provided.
+        ValueError
+            If neither a file path nor dataset was supplied.
         """
+
         if self.reg_file_path:
             if os.path.isdir(self.reg_file_path):
                 reg_file = self._find_reg_in_directory(self.reg_file_path)
@@ -75,26 +96,30 @@ class REGReader:
         elif not self.reg_dataset:
             raise ValueError("No REG file path or dataset provided.")
 
-        return REG(self.reg_dataset)
+        return REG.from_dataset(self.reg_dataset)
 
     def _find_reg_in_directory(self, directory_path):
         """
-        Searches a directory for a REG file.
+        Recursively search a directory for the first valid DICOM REG file.
 
         Parameters
         ----------
-        directory_path : str
-            Path to the directory to search.
+        directory_path : str or Path
+            The directory in which to search for REG DICOM files.
 
         Returns
         -------
-        str
-            The path to the REG file if found, otherwise None.
+        str or None
+            The full path to the first discovered REG file, or ``None`` if
+            no valid REG dataset was found.
 
-        Raises
-        ------
-        InvalidDicomError
-            If no valid REG file is found.
+        Notes
+        -----
+        Only minimal DICOM attributes are read using ``stop_before_pixels=True``,
+        which makes scanning large directories significantly faster.
+
+        Any unreadable or non-DICOM files are silently skipped.
+
         """
         for root, _, files in os.walk(directory_path):
             for file in files:

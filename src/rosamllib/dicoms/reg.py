@@ -1,217 +1,160 @@
-import pydicom
 import struct
 import numpy as np
 import matplotlib.pyplot as plt
+from pydicom.dataset import Dataset
 
 
-class REG:
+class REG(Dataset):
     """
-    A class to represent and process DICOM Registration (REG) files, extracting transformation
-    matrices, metadata, and deformation grid information for both rigid and deformable image
-    registrations.
+    DICOM Registration (REG) dataset with convenience methods for extracting
+    rigid and deformable registration information.
 
-    This class handles the extraction of transformation matrices, image information, and
-    referenced series details for rigid and deformable image registration from a DICOM REG file.
-    It provides access to the fixed and moving image details as well as the ability to plot
-    deformation grids.
+    This class subclasses :class:`pydicom.dataset.Dataset` and adds
+    registration-specific utilities to parse:
 
-    Parameters
-    ----------
-    reg_dataset : pydicom.Dataset
-        The DICOM dataset representing the REG file.
+    - Rigid transformations from ``RegistrationSequence`` /
+      ``MatrixRegistrationSequence``.
+    - Deformable vector fields from
+      ``DeformableRegistrationSequence`` /
+      ``DeformableRegistrationGridSequence``.
+    - Referenced image, series, and study identifiers for fixed and moving
+      images.
+
+    Instances are typically constructed via :meth:`REG.from_dataset`, which
+    copies all DICOM elements from a base :class:`pydicom.Dataset` and then
+    populates the registration metadata.
 
     Attributes
     ----------
-    reg_dataset : pydicom.Dataset
-        The raw DICOM dataset for the REG file.
     fixed_image_info : dict
-        Metadata and transformation matrix for the fixed image, including grid-based information
-        for deformable registrations.
+        Metadata and transformation information for the fixed image. May
+        include keys such as:
+
+        - ``"referenced_images"``: list of referenced SOPInstanceUIDs
+        - ``"SOPClassUID"``: SOP class UID of the referenced images
+        - ``"SourceFrameOfReferenceUID"``: frame of reference UID
+        - ``"SeriesInstanceUID"`` / ``"StudyInstanceUID"``
+        - ``"transformation_matrix"`` / ``"matrix"`` and related entries
+        - Grid-related fields for deformable registration (e.g. ``"grid_data"``)
     moving_image_info : dict
-        Metadata and transformation matrix for the moving image, including grid-based information
-        for deformable registrations.
+        Same structure as ``fixed_image_info``, but for the moving image.
     registration_type : str or None
-        Indicates whether the registration is 'rigid' or 'deformable'. None if the type is not
-        identified.
+        ``"rigid"`` if a ``RegistrationSequence`` is present,
+        ``"deformable"`` if a ``DeformableRegistrationSequence`` is present,
+        otherwise ``None`` (before extraction is performed).
 
     Methods
     -------
-    extract_transformation_matrices_and_metadata():
-        Extracts transformation matrices and image metadata for both rigid and deformable
-        registrations.
-
-    extract_rigid_transformation(reg_sequence):
-        Extracts transformation matrices and metadata from the RegistrationSequence for rigid
-        registrations.
-
-    extract_deformable_transformation(deformable_reg_sequence):
-        Extracts grid-based transformations for deformable registrations.
-
-    extract_image_info(reg_item):
-        Extracts transformation matrix and metadata from an individual RegistrationSequence item.
-
-    extract_matrix_transformation(matrix_registration_sequence, index):
-        Extracts matrix-based transformations from MatrixRegistrationSequence.
-
-    extract_grid_transformation(grid_sequence, index):
-        Extracts grid-based transformations from DeformableRegistrationGridSequence.
-
-    extract_referenced_series_info():
-        Extracts referenced series information from the REG file.
-
-    check_other_references():
-        Checks for additional references in StudiesContainingOtherReferencedInstancesSequence.
-
-    match_series_with_image(series_instances, image_instances):
-        Matches a series with an image based on SOPInstanceUIDs.
-
-    extract_matrix_transformation_direct(matrix_registration_sequence, index, matrix_type=""):
-        Extracts matrix transformations from sequences without a nested MatrixSequence.
-
-    get_fixed_image_info():
-        Returns the metadata and transformation matrix for the fixed image.
-
-    get_moving_image_info():
-        Returns the metadata and transformation matrix for the moving image.
-
-    dir():
-        Custom dir method to return a list of available attributes and DICOM metadata keywords.
+    from_dataset(ds)
+        Construct a :class:`REG` from an existing :class:`pydicom.Dataset`.
+    extract_transformation_matrices_and_metadata()
+        Detect and extract rigid or deformable transformation data.
+    extract_rigid_transformation(reg_sequence)
+        Parse rigid registration matrices and assign fixed/moving image info.
+    extract_deformable_transformation(deformable_reg_sequence)
+        Parse deformable grid and optional pre/post matrices.
+    extract_image_info(reg_item)
+        Extract transformation and reference info from a single registration item.
+    extract_matrix_transformation(matrix_registration_sequence)
+        Compose a 4x4 transformation matrix from ``MatrixSequence``.
+    extract_grid_transformation(grid_sequence, index)
+        Decode the deformation vector field into a 4D NumPy array.
+    extract_referenced_series_info()
+        Attach series-level UIDs to fixed/moving image info.
+    check_other_references()
+        Attach study/series UIDs from
+        ``StudiesContainingOtherReferencedInstancesSequence`` when present.
+    match_series_with_image(series_instances, image_instances)
+        Helper to test SOPInstanceUID overlap between series and image refs.
+    extract_matrix_transformation_direct(...)
+        Handle matrix sequences without a nested ``MatrixSequence``.
+    get_fixed_image_info()
+        Return the fixed-image registration metadata.
+    get_moving_image_info()
+        Return the moving-image registration metadata.
+    plot_deformation_grid(slice_index=0)
+        Visualize a 2D slice of the deformable grid using a quiver plot.
     """
 
-    def __init__(self, reg_dataset):
-        self.reg_dataset = reg_dataset
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
         self.fixed_image_info = {}
         self.moving_image_info = {}
         self.registration_type = None
 
-        # Automatically extract transformation matrices and metadata upon instantiation
-        self.extract_transformation_matrices_and_metadata()
-
-        # Extract referenced series information
-        self.extract_referenced_series_info()
-
-        # Check for other references
-        self.check_other_references()
-
-    def __getattr__(self, attr):
+    @classmethod
+    def from_dataset(cls, ds: Dataset) -> "REG":
         """
-        Allows attribute access for DICOM metadata via dot notation.
+        Create a :class:`REG` instance from an existing DICOM dataset.
+
+        This copies all data elements from ``ds`` into a new :class:`REG`
+        instance and then runs the extraction pipeline to populate
+        ``fixed_image_info``, ``moving_image_info``, and ``registration_type``.
 
         Parameters
         ----------
-        attr : str
-            The attribute being accessed (e.g., 'PatientID').
+        ds : pydicom.Dataset
+            A DICOM dataset representing a REG object (Modality ``"REG"``).
 
         Returns
         -------
-        str
-            The value of the requested DICOM metadata tag.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute is not a valid DICOM keyword or metadata is not found.
+        REG
+            A fully initialized :class:`REG` instance with parsed registration
+            metadata.
         """
-        if attr in self.dir():
-            return getattr(self.reg_dataset, attr)
+        reg = cls()
+        reg.update(ds)
 
-        raise AttributeError(f"'REG' object has no attribute '{attr}'")
-
-    def __setattr__(self, attr, value):
-        """
-        Allows setting DICOM metadata attributes via dot notation.
-
-        Parameters
-        ----------
-        attr : str
-            The attribute being set (e.g., 'PatientID').
-        value : str
-            The value to be assigned to the attribute.
-
-        Raises
-        ------
-        AttributeError
-            If the attribute is not a valid DICOM keyword or if setting fails.
-        """
-        if attr == "reg_dataset":
-            super().__setattr__(attr, value)
-            return
-
-        try:
-            # Try to find the corresponding DICOM tag for the keyword
-            tag = pydicom.datadict.tag_for_keyword(attr)
-            if tag is not None:
-                tag_obj = pydicom.tag.Tag(tag)
-                tag_str = f"{tag_obj.group:04X}|{tag_obj.element:04X}"
-                self.reg_dataset[tag_str].value = value
-            else:
-                # If it's not a valid DICOM tag, set it as a regular attribute
-                super().__setattr__(attr, value)
-        except Exception:
-            # If anything goes wrong, fall back to setting the attribute normally
-            super().__setattr__(attr, value)
-
-    def __dir__(self):
-        """
-        Returns a list of attributes and DICOM metadata keywords.
-
-        Returns
-        -------
-        list
-            A combined list of attributes and DICOM metadata keywords.
-        """
-        default_dir = super().__dir__()
-        dicom_keywords = [pydicom.datadict.keyword_for_tag(tag) for tag in self.reg_dataset.keys()]
-        dicom_keywords = [keyword for keyword in dicom_keywords if keyword]  # Filter out None
-
-        # Combine the default attributes with the DICOM keywords
-        return default_dir + dicom_keywords
-
-    def dir(self):
-        """
-        Custom dir method to return a list of available attributes and DICOM metadata keywords.
-
-        Returns
-        -------
-        list of str
-            List of all attributes, including DICOM metadata keywords.
-        """
-        return self.__dir__()
+        if hasattr(ds, "file_meta"):
+            reg.file_meta = ds.file_meta
+        reg.fixed_image_info = {}
+        reg.moving_image_info = {}
+        reg.registration_type = None
+        reg.extract_transformation_matrices_and_metadata()
+        reg.extract_referenced_series_info()
+        reg.check_other_references()
+        return reg
 
     def extract_transformation_matrices_and_metadata(self):
         """
-        Extracts transformation matrices and metadata for both rigid and deformable registrations.
+        Extract transformation matrices and registration metadata.
+
+        Determines whether the dataset represents a rigid or deformable
+        registration, sets :attr:`registration_type`, and dispatches to
+        the appropriate extraction method.
 
         Raises
         ------
         ValueError
-            If neither a RegistrationSequence nor DeformableRegistrationSequence is found.
+            If neither ``RegistrationSequence`` nor
+            ``DeformableRegistrationSequence`` is present in the dataset.
         """
-        ds = self.reg_dataset
-        if "RegistrationSequence" in ds:
+        if "RegistrationSequence" in self:
             self.registration_type = "rigid"
-            self.extract_rigid_transformation(ds.RegistrationSequence)
+            self.extract_rigid_transformation(self.RegistrationSequence)
 
-        elif "DeformableRegistrationSequence" in ds:
+        elif "DeformableRegistrationSequence" in self:
             self.registration_type = "deformable"
-            self.extract_deformable_transformation(ds.DeformableRegistrationSequence)
+            self.extract_deformable_transformation(self.DeformableRegistrationSequence)
         else:
             raise ValueError("No RegistrationSequence or DeformableRegistrationSequence found.")
 
     def extract_rigid_transformation(self, reg_sequence):
         """
-        Extracts transformation matrices and metadata for rigid registration.
+        Extract transformation matrices and metadata for rigid registration.
 
         Parameters
         ----------
         reg_sequence : pydicom.Sequence
-            The DICOM sequence for rigid registration.
+            The ``RegistrationSequence`` from the REG dataset. Must contain
+            exactly two items corresponding to the fixed and moving images.
 
         Raises
         ------
         ValueError
-            If there are not exactly two items in the RegistrationSequence
-            (fixed and moving images).
+            If there are not exactly two items in the sequence, or if
+            ``FrameOfReferenceUID`` is missing from one or both items.
         """
         if len(reg_sequence) != 2:
             raise ValueError(
@@ -223,7 +166,7 @@ class REG:
 
         # Identify fixed and moving images using Frame of Reference UID
         if "SourceFrameOfReferenceUID" in img_info_1 and "SourceFrameOfReferenceUID" in img_info_2:
-            if img_info_1["SourceFrameOfReferenceUID"] == self.reg_dataset.FrameOfReferenceUID:
+            if img_info_1["SourceFrameOfReferenceUID"] == self.FrameOfReferenceUID:
                 self.fixed_image_info = img_info_1
                 self.moving_image_info = img_info_2
             else:
@@ -237,12 +180,12 @@ class REG:
 
     def extract_deformable_transformation(self, deformable_reg_sequence):
         """
-        Extracts transformation matrices and grid-based information for deformable registration.
+        Extract transformation matrices and grid-based information for deformable registration.
 
         Parameters
         ----------
         deformable_reg_sequence : pydicom.Sequence
-            The DICOM sequence for deformable registration.
+            The ``DeformableRegistrationSequence`` from the REG dataset.
         """
         for i, sequence_item in enumerate(deformable_reg_sequence):
             image_info = {}
@@ -282,18 +225,23 @@ class REG:
 
     def extract_image_info(self, reg_item):
         """
-        Extracts transformation matrix and metadata from a single item in the RegistrationSequence.
+        Extract transformation matrix and metadata from a single registration item.
 
         Parameters
         ----------
         reg_item : pydicom.Dataset
-            An item from the RegistrationSequence.
+            An item from ``RegistrationSequence`` or a similar registration
+            sequence.
 
         Returns
         -------
         dict
-            A dictionary containing the transformation matrix, transformation type,
-            SOPClassUID, and referenced SOP Instance UIDs.
+            Dictionary containing:
+
+            - ``"transformation_matrix"`` and ``"transformation_type"`` (if present)
+            - ``"referenced_images"``: list of referenced SOPInstanceUIDs
+            - ``"SOPClassUID"`` of the referenced images
+            - ``"SourceFrameOfReferenceUID"`` derived from ``FrameOfReferenceUID``
         """
         image_info = {}
         if "MatrixRegistrationSequence" in reg_item:
@@ -318,17 +266,27 @@ class REG:
 
     def extract_matrix_transformation(self, matrix_registration_sequence):
         """
-        Extracts matrix-based transformations from MatrixRegistrationSequence.
+        Extract and compose matrix-based transformations from a MatrixRegistrationSequence.
 
         Parameters
         ----------
         matrix_registration_sequence : pydicom.Sequence
-            The sequence containing transformation matrices.
+            A ``MatrixRegistrationSequence`` containing one or more items, each
+            with a nested ``MatrixSequence``.
+
+        Returns
+        -------
+        dict
+            Dictionary with:
+
+            - ``"transformation_matrix"``: 4x4 NumPy array
+            - ``"transformation_type"``: value of
+              ``FrameOfReferenceTransformationMatrixType``
 
         Raises
         ------
         ValueError
-            If MatrixRegistrationSequence is not found.
+            If the inner ``MatrixSequence`` is empty.
         """
         matrix_seq = matrix_registration_sequence[0].MatrixSequence
 
@@ -350,26 +308,29 @@ class REG:
 
     def extract_grid_transformation(self, grid_sequence, index):
         """
-        Extracts grid-based transformations for deformable registration.
+        Extract grid-based transformations for deformable registration.
 
         Parameters
         ----------
         grid_sequence : pydicom.Sequence
-            The sequence containing grid-based transformation data.
+            A ``DeformableRegistrationGridSequence`` containing the vector grid.
         index : int
-            Index representing whether the data is for the fixed (0) or moving (1) image.
+            Index representing whether the data corresponds to the fixed (0) or
+            moving (1) image.
 
         Raises
         ------
         ValueError
-            If there is a mismatch in the expected and actual grid data size.
+            If there is a mismatch between the expected and actual grid data size.
         """
         grid_seq = grid_sequence[0]
         grid_data_bytes = grid_seq.VectorGridData
 
+        # Normalize GridDimensions
+        grid_dimensions = tuple(int(d) for d in grid_seq.GridDimensions)
+
         # Determine the expected shape and number of elements (3 for vector components x, y, z)
-        grid_dimensions = grid_seq.GridDimensions
-        expected_elements = np.prod(grid_dimensions) * 3
+        expected_elements = int(np.prod(grid_dimensions)) * 3
 
         # Assuming 32-bit (4-byte) floating-point numbers (float32)
         element_size = 4  # bytes
@@ -387,14 +348,19 @@ class REG:
 
         # Reshape the unpacked data into (dimX, dimY, dimZ, 3) where 3 represents
         # x, y, z components
-        grid_data = np.array(unpacked_grid_data).reshape(grid_dimensions + [3])
+        grid_data = np.array(unpacked_grid_data, dtype=np.float32).reshape(
+            grid_dimensions[0],
+            grid_dimensions[1],
+            grid_dimensions[2],
+            3,
+        )
 
         image_info = {
             "grid_data": grid_data,
-            "grid_dimensions": grid_seq.GridDimensions,
-            "grid_resolution": grid_seq.GridResolution,
-            "image_orientation": grid_seq.ImageOrientationPatient,
-            "image_position": grid_seq.ImagePositionPatient,
+            "grid_dimensions": grid_dimensions,
+            "grid_resolution": tuple(grid_seq.GridResolution),
+            "image_orientation": list(grid_seq.ImageOrientationPatient),
+            "image_position": list(grid_seq.ImagePositionPatient),
         }
 
         # Store grid information
@@ -406,16 +372,19 @@ class REG:
 
     def extract_referenced_series_info(self):
         """
-        Extracts referenced series information from the DICOM dataset.
+        Extract referenced series information from the REG dataset.
 
-        Parameters
-        ----------
-        ds : pydicom.Dataset
-            The DICOM dataset object representing the REG file.
+        When ``ReferencedSeriesSequence`` is present at the top level, this
+        method scans the referenced instances and, based on overlapping
+        SOPInstanceUIDs, assigns:
+
+        - ``"SeriesInstanceUID"`` to :attr:`fixed_image_info` and/or
+          :attr:`moving_image_info`.
+
+        This helps link the registration to specific image series.
         """
-        ds = self.reg_dataset
-        if "ReferencedSeriesSequence" in ds:
-            for series_item in ds.ReferencedSeriesSequence:
+        if "ReferencedSeriesSequence" in self:
+            for series_item in self.ReferencedSeriesSequence:
                 series_info = {
                     "SeriesInstanceUID": series_item.SeriesInstanceUID,
                     "ReferencedInstances": [
@@ -437,16 +406,19 @@ class REG:
 
     def check_other_references(self):
         """
-        Checks for additional references in StudiesContainingOtherReferencedInstancesSequence.
+        Populate additional study and series references, if available.
 
-        Parameters
-        ----------
-        ds : pydicom.Dataset
-            The DICOM dataset object representing the REG file.
+        When ``StudiesContainingOtherReferencedInstancesSequence`` is present,
+        this method traverses those structures and, based on SOPInstanceUID
+        overlap, attaches:
+
+        - ``"SeriesInstanceUID"`` and, when present,
+        - ``"StudyInstanceUID"``
+
+        to :attr:`fixed_image_info` and/or :attr:`moving_image_info`.
         """
-        ds = self.reg_dataset
-        if "StudiesContainingOtherReferencedInstancesSequence" in ds:
-            for study in ds.StudiesContainingOtherReferencedInstancesSequence:
+        if "StudiesContainingOtherReferencedInstancesSequence" in self:
+            for study in self.StudiesContainingOtherReferencedInstancesSequence:
                 if "ReferencedSeriesSequence" in study:
                     for series_item in study.ReferencedSeriesSequence:
                         other_referenced_instances = [
@@ -475,19 +447,20 @@ class REG:
 
     def match_series_with_image(self, series_instances, image_instances):
         """
-        Matches a series with an image based on SOPInstanceUIDs.
+        Check whether a referenced series matches a set of image SOPInstanceUIDs.
 
         Parameters
         ----------
         series_instances : list of str
-            SOPInstanceUIDs from the series.
+            SOPInstanceUIDs referenced by a series.
         image_instances : list of str
-            SOPInstanceUIDs from the image.
+            SOPInstanceUIDs associated with a fixed or moving image.
 
         Returns
         -------
         bool
-            True if there is a match, False otherwise.
+            ``True`` if any SOPInstanceUID is shared between the two lists,
+            otherwise ``False``.
         """
         # Check if any SOPInstanceUID in the series matches the SOPInstanceUIDs in the image info
         return any(instance_uid in image_instances for instance_uid in series_instances)
@@ -496,21 +469,29 @@ class REG:
         self, matrix_registration_sequence, index, matrix_type=""
     ):
         """
-        Extracts matrix transformations from sequences without a nested MatrixSequence.
+        Extract matrix transformations from a sequence without a nested MatrixSequence.
+
+        This is used for sequences such as
+        ``PreDeformationMatrixRegistrationSequence`` and
+        ``PostDeformationMatrixRegistrationSequence`` where the
+        transformation matrix is stored directly on the sequence items.
 
         Parameters
         ----------
         matrix_registration_sequence : pydicom.Sequence
-            The sequence containing the transformation matrices.
+            The sequence containing a single item with
+            ``FrameOfReferenceTransformationMatrix`` and
+            ``FrameOfReferenceTransformationMatrixType``.
         index : int
             Index representing whether the data is for the fixed (0) or moving (1) image.
-        matrix_type : str
-            Type of matrix (e.g., "pre", "post").
+        matrix_type : str, optional
+            Type of matrix (e.g., ``"pre"``, ``"post"``). Used to decide
+            where in the info dict the matrix is stored.
 
         Raises
         ------
         ValueError
-            If MatrixRegistrationSequence is not found.
+            If the sequence is empty.
         """
         if len(matrix_registration_sequence) > 0:
             # Directly extract FrameOfReferenceTransformationMatrix and Type
@@ -532,16 +513,16 @@ class REG:
 
     def _store_matrix_info(self, image_info, index, matrix_type):
         """
-        Stores transformation matrix information in the correct place for fixed or moving image.
+        Store transformation matrix information for the fixed or moving image.
 
         Parameters
         ----------
         image_info : dict
-            A dictionary containing the transformation matrix and related metadata.
+            Dictionary containing the transformation matrix and related metadata.
         index : int
             Index representing whether the data is for the fixed (0) or moving (1) image.
         matrix_type : str
-            Type of matrix (e.g., "pre", "post").
+            Type of matrix (e.g., ``"pre"``, ``"post"``, or ``""`` for main matrix).
         """
         if index == 0:
             # Fixed image
@@ -562,17 +543,21 @@ class REG:
 
     def get_fixed_image_info(self):
         """
-        Returns the transformation matrix and metadata for the fixed image.
+        Return the registration metadata for the fixed image.
 
         Returns
         -------
         dict
-            Dictionary containing the transformation matrix and metadata for the fixed image.
+            Dictionary containing the transformation matrix, referenced image
+            identifiers, and any series/study/grid metadata associated with
+            the fixed image.
 
         Raises
         ------
         ValueError
-            If the fixed image information has not been loaded.
+            If the fixed image information has not been populated. Ensure that
+            the instance was created via :meth:`REG.from_dataset` or
+            :class:`REGReader` before calling this method.
         """
         if not self.fixed_image_info:
             raise ValueError("Fixed image information not loaded. Call `read` method first.")
@@ -580,17 +565,21 @@ class REG:
 
     def get_moving_image_info(self):
         """
-        Returns the transformation matrix and metadata for the moving image.
+        Return the registration metadata for the moving image.
 
         Returns
         -------
         dict
-            Dictionary containing the transformation matrix and metadata for the moving image.
+            Dictionary containing the transformation matrix, referenced image
+            identifiers, and any series/study/grid metadata associated with
+            the moving image.
 
         Raises
         ------
         ValueError
-            If the moving image information has not been loaded.
+            If the moving image information has not been populated. Ensure that
+            the instance was created via :meth:`REG.from_dataset` or
+            :class:`REGReader` before calling this method.
         """
         if not self.moving_image_info:
             raise ValueError("Moving image information not loaded. Call `read` method first.")
@@ -598,21 +587,26 @@ class REG:
 
     def plot_deformation_grid(self, slice_index=0):
         """
-        Plots the deformation grid using matplotlib's quiver plot for a 2D view of the grid data.
+        Visualize a 2D slice of the deformable registration grid.
+
+        This uses :mod:`matplotlib`'s quiver plot to display the in-plane
+        deformation vectors (x and y components) for a given slice of the
+        3D deformation grid stored in :attr:`moving_image_info`.
 
         Parameters
         ----------
-        slice_index : int
-            The index of the slice in the 3D grid to visualize.
+        slice_index : int, optional
+            Index of the slice along the third grid dimension (z-axis) to
+            visualize.
 
         Raises
         ------
         ValueError
-            If the grid data is not available.
+            If grid data is expected but not available.
         """
         if "grid_data" in self.moving_image_info:
             grid = self.moving_image_info["grid_data"]
-            dimensions = self.moving_image_info["grid_dimensions"]
+            dimensions = tuple(int(d) for d in self.moving_image_info["grid_dimensions"])
 
             if slice_index >= dimensions[2]:
                 print(f"Slice index {slice_index} is out of bounds.")
@@ -632,11 +626,32 @@ class REG:
         else:
             print("No deformation grid data available for visualization.")
 
-    def __contains__(self, key):
-        return key in self.reg_dataset
+    def __repr__(self) -> str:
+        """
+        Return a concise string representation of the REG object.
 
-    def __getitem__(self, key):
-        return self.reg_dataset[key]
+        The representation includes the registration type, series instance UIDs
+        (if available) for fixed and moving images, and the number of referenced
+        images attached to each.
 
-    def keys(self):
-        return self.reg_dataset.keys()
+        Examples
+        --------
+        >>> reg
+        REG(registration_type='rigid', fixed_series='1.2.3', moving_series='4.5.6',
+            fixed_refs=3, moving_refs=3)
+        """
+        reg_type = self.registration_type or "unknown"
+        fixed_series = self.fixed_image_info.get("SeriesInstanceUID", "N/A")
+        moving_series = self.moving_image_info.get("SeriesInstanceUID", "N/A")
+        fixed_refs = len(self.fixed_image_info.get("referenced_images", []))
+        moving_refs = len(self.moving_image_info.get("referenced_images", []))
+
+        return (
+            "REG("
+            f"registration_type={reg_type!r}, "
+            f"fixed_series={fixed_series!r}, "
+            f"moving_series={moving_series!r}, "
+            f"fixed_refs={fixed_refs}, "
+            f"moving_refs={moving_refs}"
+            ")"
+        )
