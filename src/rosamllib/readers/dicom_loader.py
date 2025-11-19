@@ -1,21 +1,16 @@
 import os
 import time
-import traceback
-import graphviz
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
 import multiprocessing as mp
-from io import BytesIO
 from functools import partial, lru_cache
 from typing import Iterable, List, Optional, Set, Union, Any, Dict
-from collections import defaultdict, deque
+from collections import defaultdict
 from itertools import chain
 from pydicom import dcmread
-from pydicom.tag import Tag, BaseTag
+import pydicom
+from pydicom.tag import Tag
 from pydicom.datadict import keyword_for_tag, tag_for_keyword, dictionary_VR
 from dataclasses import dataclass
-from rosamllib.dicoms.rtimage import RTIMAGE
 from rosamllib.readers import (
     DICOMImageReader,
     RTStructReader,
@@ -25,9 +20,10 @@ from rosamllib.readers import (
     RTPlanReader,
     RTRecordReader,
     SEGReader,
+    RTImageReader,
 )
 from rosamllib.constants import VR_TO_DTYPE
-from rosamllib.readers.dicom_nodes import (
+from rosamllib.nodes import (
     DatasetNode,
     SeriesNode,
     InstanceNode,
@@ -38,11 +34,16 @@ from rosamllib.utils import (
     parse_vr_value,
     get_referenced_sop_instance_uids,
     extract_rtstruct_for_uids,
+    get_referenced_nodes,
+    get_referencing_nodes,
+    get_frame_registered_nodes,
+    get_nodes_for_patient,
+    associate_dicoms,
     deprecated,
 )
-from rosamllib.readers.query_dicom import query_instances, QueryOptions
+from rosamllib.viewers import visualize_series_references
+from rosamllib.nodes.query_dicom import query_instances, QueryOptions
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from string import hexdigits
 
 
 def in_jupyter():
@@ -148,176 +149,10 @@ class TagPlan:
     # parser: Any
 
 
-def _parse_int_flex(x) -> int:
-    """Parse int from diverse formats: int, '0x..', hex '0010', or decimal '16'."""
-    if isinstance(x, int):
-        return x
-    s = str(x).strip().lower()
-    # strip surrounding parentheses if any
-    if s.startswith("(") and s.endswith(")"):
-        s = s[1:-1].strip()
-    # remove spaces
-    s = s.replace(" ", "")
-    # hex with 0x
-    if s.startswith("0x"):
-        return int(s, 16)
-    # pure hex? (all chars hex and typical length <= 4)
-    if all(c in hexdigits for c in s):
-        try:
-            return int(s, 16)
-        except ValueError:
-            pass
-    # fallback decimal
-    return int(s, 10)
-
-
-def _to_tag(obj) -> Optional[Tag]:
-    """
-    Return a pydicom Tag for many input shapes, or None if unresolvable.
-    Accepts keyword, Tag, int, (g,e) tuple, 'GGGG,EEEE', '(GGGG, EEEE)', '(16, 32)', '00100020'.
-    """
-    if obj is None:
-        return None
-
-    # already a Tag
-    if isinstance(obj, BaseTag):
-        return Tag(obj)
-
-    # keyword?
-    tnum = tag_for_keyword(str(obj))
-    if tnum:
-        return Tag(tnum)
-
-    # tuple?
-    if isinstance(obj, tuple) and len(obj) == 2:
-        try:
-            g = _parse_int_flex(obj[0])
-            e = _parse_int_flex(obj[1])
-            return Tag((g, e))
-        except Exception:
-            return None
-
-    # string forms
-    if isinstance(obj, str):
-        s = obj.strip()
-        # strip parentheses like "(16, 32)" or "(0010, 0020)"
-        if s.startswith("(") and s.endswith(")"):
-            s = s[1:-1]
-        s = s.strip()
-        s_wo_spaces = s.replace(" ", "")
-
-        # 'GGGG,EEEE' or '16,32'
-        if "," in s_wo_spaces:
-            try:
-                g_str, e_str = s_wo_spaces.split(",", 1)
-                g = _parse_int_flex(g_str)
-                e = _parse_int_flex(e_str)
-                return Tag((g, e))
-            except Exception:
-                return None
-
-        # '00100020' (8 hex chars)
-        if len(s_wo_spaces) == 8 and all(c in hexdigits for c in s_wo_spaces):
-            try:
-                g = int(s_wo_spaces[:4], 16)
-                e = int(s_wo_spaces[4:], 16)
-                return Tag((g, e))
-            except Exception:
-                return None
-
-        # try as a single int (decimal or hex)
-        try:
-            return Tag(_parse_int_flex(s_wo_spaces))
-        except Exception:
-            return None
-
-    # last resort: try Tag(obj)
-    try:
-        return Tag(obj)
-    except Exception:
-        return None
-
-
-def _as_specific_key(tag_like: Any) -> str:
-    t = _to_tag(tag_like)
-    if t is not None:
-        return f"{int(t.group):04X},{int(t.element):04X}"
-    # fall back trying to preserve keyword if resolvable
-    tnum = tag_for_keyword(str(tag_like))
-    if tnum:
-        return keyword_for_tag(tnum) or f"{int(Tag(tnum).group):04X},{int(Tag(tnum).element):04X}"
-    # last resort: return original string
-    return str(tag_like)
-
-
-def _build_specific_tags_set(user_tags: Optional[Iterable[Any]]) -> set:
-    wanted = set()
-    # core basics
-    for k in CORE_TAGS:
-        t = _to_tag(k)
-        if t is not None:
-            wanted.add(t)
-    # user-specified (can be Tag, TagPlan, keyword, etc.)
-    if user_tags:
-        for u in user_tags:
-            t = getattr(u, "tag", None)  # TagPlan?
-            if t is None:
-                t = _to_tag(u)
-            if t is not None:
-                wanted.add(t)
-    return wanted
-
-
 def _specific_from_tag_plan(tag_plan: Optional[list[TagPlan]]) -> set[Tag]:
     if not tag_plan:
         return set()
     return {tp.tag for tp in tag_plan}
-
-
-def _extend_for_modalities(
-    tag_set: Set[Tag], *, rt_common=False, rtstruct=False, seg=False
-) -> None:
-    if rt_common:
-        for k in RT_COMMON_SEQ:
-            t = _to_tag(k)
-            tag_set.add(t) if t else None
-    if rtstruct:
-        for k in RTSTRUCT_SEQ:
-            t = _to_tag(k)
-            tag_set.add(t) if t else None
-    if seg:
-        for k in SEG_SEQ:
-            t = _to_tag(k)
-            tag_set.add(t) if t else None
-
-
-def _build_specific_tags(
-    user_tags: Optional[Iterable[Any]] = None,
-    *,
-    include_rt_common: bool = False,
-    include_rtstruct: bool = False,
-    include_seg: bool = False,
-) -> List[str]:
-    """
-    Compose a deduped list for dcmread(specific_tags=...).
-    """
-    wanted: Set[str] = set(_as_specific_key(t) for t in CORE_TAGS)
-
-    if user_tags:
-        for t in user_tags:
-            wanted.add(_as_specific_key(t))
-
-    if include_rt_common:
-        for t in RT_COMMON_SEQ:
-            wanted.add(_as_specific_key(t))
-    if include_rtstruct:
-        for t in RTSTRUCT_SEQ:
-            wanted.add(_as_specific_key(t))
-    if include_seg:
-        for t in SEG_SEQ:
-            wanted.add(_as_specific_key(t))
-
-    return sorted(wanted)
 
 
 def _max_workers_io():
@@ -446,16 +281,15 @@ def process_reg_file(filepath, tag_plan, seq_policy):
 
 def process_raw_file(filepath, tag_plan, seq_policy):
     raw_reader = DICOMRawReader(filepath)
-    raw_reader.read()
-    ds = raw_reader.dataset
-    metadata = get_metadata(ds, tag_plan, seq_policy)
+    raw = raw_reader.read()
+    metadata = get_metadata(raw, tag_plan, seq_policy)
     instance_dict = {
         "FilePath": filepath,
         **metadata,
     }
     embedded_instances = []
     try:
-        embedded_datasets = raw_reader.get_embedded_datasets()
+        embedded_datasets = raw.get_embedded_datasets()
 
         for embedded_ds in embedded_datasets:
             embedded_metadata = get_metadata(embedded_ds, tag_plan, seq_policy)
@@ -757,7 +591,7 @@ class DICOMLoader:
     def _load_files(self, files, seq_policy, tag_plan=None):
         process_file_with_tags = partial(process_file, tag_plan=tag_plan, seq_policy=seq_policy)
 
-        unresolved_raw_links = []
+        # unresolved_raw_links = []
         metadata_rows = []
         exclude_keys = {
             "FilePath",
@@ -831,27 +665,13 @@ class DICOMLoader:
                             if other_sid:
                                 instance_node.other_referenced_sids.append(other_sid)
 
-                    if inst_dict.get("is_embedded_in_raw"):
-                        series.is_embedded_in_raw = True
-                        unresolved_raw_links.append(
-                            (patient_id, series, inst_dict.get("raw_series_reference_uid"))
-                        )
-
                     metadata_rows.append(
                         {k: v for k, v in inst_dict.items() if k not in exclude_keys}
                     )
 
                 pbar.update(1)
 
-        # Resolve RAW parents (after all series exist)
-        for pid, child_series, raw_sid in unresolved_raw_links:
-            if raw_sid:
-                parent = self.dicom_files.get(pid, {}).get(raw_sid)
-                if parent:
-                    child_series.raw_series_reference = parent
-
-        # Wire associations
-        DICOMLoader._associate_dicoms(self.dicom_files)
+        associate_dicoms(self.dataset)
 
         # Build SOP index
         self._sop_to_instance = {
@@ -882,217 +702,6 @@ class DICOMLoader:
                 self.metadata_df[col] = pd.to_datetime(self.metadata_df[col], errors="coerce")
             else:
                 self.metadata_df[col] = self.metadata_df[col].astype(dtype, errors="ignore")
-
-    @staticmethod
-    def _associate_dicoms(dicom_files):
-        """
-        Associates DICOM files based on referenced SOPInstanceUIDs and SeriesInstanceUIDs.
-        - Builds SOP/Series/FrameOfReference maps
-        - Wires instance<->instance, instance->series, and series<->series edges
-        - Populates reverse edges for efficient "referencing" queries
-        - Ensures FoR connectivity is symmetric
-        - NEW: RTSTRUCT InstanceNode.FrameOfReferenceUIDs is populated as the union of
-            FoRs parsed from the DICOM and FoRs of referenced image series.
-        """
-        # sidecar state for fast identity de-dup per list
-        _seen_map = {}
-
-        def _append_unique(lst, obj):
-            if obj is None:
-                return
-            lid = id(lst)
-            s = _seen_map.get(lid)
-            if s is None:
-                s = set(id(x) for x in lst)
-                _seen_map[lid] = s
-            oid = id(obj)
-            if oid not in s:
-                lst.append(obj)
-                s.add(oid)
-
-        # Build lookup maps
-        sop_instance_uid_map = {}
-        series_uid_map = {}
-        frame_of_reference_uid_map = {}
-
-        for _pid, series_dict in dicom_files.items():
-            for sid, series in series_dict.items():
-                series_uid_map[sid] = series
-
-                # ensure series containers exist
-                series.referencing_series = getattr(series, "referencing_series", [])
-                series.referenced_series = getattr(series, "referenced_series", [])
-                series.frame_of_reference_registered = getattr(
-                    series, "frame_of_reference_registered", []
-                )
-
-                for sop_uid, inst in series.instances.items():
-                    sop_instance_uid_map[sop_uid] = inst
-
-                    # ensure instance containers exist
-                    inst.referenced_instances = getattr(inst, "referenced_instances", [])
-                    inst.referencing_instances = getattr(inst, "referencing_instances", [])
-                    inst.referenced_series = getattr(inst, "referenced_series", [])
-                    inst.other_referenced_series = getattr(inst, "other_referenced_series", [])
-                    inst.referenced_sop_instance_uids = getattr(
-                        inst, "referenced_sop_instance_uids", []
-                    )
-                    inst.referenced_sids = getattr(inst, "referenced_sids", [])
-                    inst.other_referenced_sids = getattr(inst, "other_referenced_sids", [])
-
-                    # NEW: normalize multi-FoR field on instance (esp. RTSTRUCT)
-                    inst.FrameOfReferenceUIDs = list(
-                        getattr(inst, "FrameOfReferenceUIDs", []) or []
-                    )
-
-                # map FoR -> series list
-                if getattr(series, "FrameOfReferenceUID", None):
-                    frame_of_reference_uid_map.setdefault(series.FrameOfReferenceUID, []).append(
-                        series
-                    )
-
-        # Wire references
-        for _pid, series_dict in dicom_files.items():
-            for sid, series in series_dict.items():
-                for sop_uid, inst in series.instances.items():
-                    modality = getattr(inst, "Modality", None)
-
-                    # A) SOPInstanceUID links (instance -> instance)
-                    for ref_sop_uid in getattr(inst, "referenced_sop_instance_uids", []):
-                        ref_inst = sop_instance_uid_map.get(ref_sop_uid)
-                        if not ref_inst:
-                            continue
-
-                        _append_unique(inst.referenced_instances, ref_inst)
-                        _append_unique(ref_inst.referencing_instances, inst)
-
-                        # promote to series-level edges
-                        src_series = inst.parent_series
-                        dst_series = getattr(ref_inst, "parent_series", None)
-                        if src_series and dst_series and src_series is not dst_series:
-                            _append_unique(src_series.referenced_series, dst_series)
-                            _append_unique(dst_series.referencing_series, src_series)
-                            _append_unique(inst.referenced_series, dst_series)
-
-                    # B) Modality-specific aggregation of series links
-                    if modality in {"RTSTRUCT", "RTPLAN", "RTDOSE", "RTRECORD"}:
-                        for ref_inst in inst.referenced_instances:
-                            rs = ref_inst.parent_series
-                            if rs:
-                                _append_unique(inst.referenced_series, rs)
-                                _append_unique(inst.referenced_sids, rs.SeriesInstanceUID)
-
-                    if modality == "REG":
-                        for ref_sid in getattr(inst, "referenced_sids", []):
-                            rs = series_uid_map.get(ref_sid)
-                            if rs:
-                                _append_unique(inst.referenced_series, rs)
-                        for other_sid in getattr(inst, "other_referenced_sids", []):
-                            rs = series_uid_map.get(other_sid)
-                            if rs:
-                                _append_unique(inst.other_referenced_series, rs)
-                                _append_unique(inst.referenced_series, rs)
-
-                    if modality == "SEG":
-                        for ref_sid in getattr(inst, "referenced_sids", []):
-                            rs = series_uid_map.get(ref_sid)
-                            if rs:
-                                _append_unique(inst.referenced_series, rs)
-
-                    # C) Promote instance->series to series<->series (reverse edges)
-                    for rs in list(getattr(inst, "referenced_series", [])):
-                        src_series = inst.parent_series
-                        if src_series and rs and src_series is not rs:
-                            _append_unique(src_series.referenced_series, rs)
-                            _append_unique(rs.referencing_series, src_series)
-
-                    for rs in list(getattr(inst, "other_referenced_series", [])):
-                        src_series = inst.parent_series
-                        if src_series and rs and src_series is not rs:
-                            _append_unique(src_series.referenced_series, rs)
-                            _append_unique(rs.referencing_series, src_series)
-
-                    # D) NEW: RTSTRUCT multi-FoR reconciliation on the instance
-                    if (modality or "").upper() == "RTSTRUCT":
-                        # FoRs from referenced image series present in this dataset
-                        fors_from_series = {
-                            s.FrameOfReferenceUID
-                            for s in getattr(inst, "referenced_series", [])
-                            if getattr(s, "FrameOfReferenceUID", None)
-                        }
-                        # FoRs parsed from the RTSTRUCT dataset earlier (loader populated)
-                        fors_from_ds = set(inst.FrameOfReferenceUIDs or [])
-                        # Union and store back on the instance
-                        inst.FrameOfReferenceUIDs = sorted(
-                            {str(u) for u in (fors_from_series | fors_from_ds) if u}
-                        )
-
-        # --- EFFECTIVE FrameOfReference connectivity (symmetric, series-level) ---
-
-        # Reset precomputed neighbors
-        for _pid, series_dict in dicom_files.items():
-            for _sid, s in series_dict.items():
-                s.frame_of_reference_registered = getattr(s, "frame_of_reference_registered", [])
-                s.frame_of_reference_registered[:] = []
-
-        # Build FoR -> [series] buckets directly
-        for_to_series = {}  # str -> list[SeriesNode]
-
-        for _pid, series_dict in dicom_files.items():
-            for _sid, s in series_dict.items():
-                fors = set()
-
-                # series-level FoR
-                fo = getattr(s, "FrameOfReferenceUID", None)
-                if fo:
-                    fors.add(str(fo))
-
-                # derive from instances + their referenced series
-                for inst in getattr(s, "instances", {}).values():
-                    for u in getattr(inst, "FrameOfReferenceUIDs", []) or []:
-                        if u:
-                            fors.add(str(u))
-                    for rs in getattr(inst, "referenced_series", []) or []:
-                        u = getattr(rs, "FrameOfReferenceUID", None)
-                        if u:
-                            fors.add(str(u))
-
-                # (optional) only set if the field exists on a non-slotted class
-                if hasattr(s, "EffectiveFrameOfReferenceUIDs"):
-                    try:
-                        setattr(s, "EffectiveFrameOfReferenceUIDs", sorted(fors))
-                    except Exception:
-                        pass  # ignore if slotted
-
-                # bucket this series by each FoR
-                for u in fors:
-                    for_to_series.setdefault(u, []).append(s)
-
-        # Dedup helper (by identity)
-        _seen_map = {}
-
-        def _append_unique(lst, obj):
-            if obj is None:
-                return
-            lid = id(lst)
-            seen = _seen_map.get(lid)
-            if seen is None:
-                seen = set(id(x) for x in lst)
-                _seen_map[lid] = seen
-            oid = id(obj)
-            if oid not in seen:
-                lst.append(obj)
-                seen.add(oid)
-
-        # Symmetric neighbors within each effective FoR bucket
-        for u, series_list in for_to_series.items():
-            n = len(series_list)
-            for i in range(n):
-                si = series_list[i]
-                for j in range(n):
-                    if i == j:
-                        continue
-                    _append_unique(si.frame_of_reference_registered, series_list[j])
 
     def _normalize_tag(self, tag):
         """
@@ -1186,7 +795,8 @@ class DICOMLoader:
             * ``'PATIENT'``  → columns: ``['PatientID']``
             * ``'STUDY'``    → columns: ``['PatientID', 'StudyInstanceUID']``
             * ``'SERIES'``   → columns: ``['PatientID', 'StudyInstanceUID', 'SeriesInstanceUID']``
-            * ``'INSTANCE'`` → columns: ``['PatientID', 'StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID']``
+            * ``'INSTANCE'`` → columns: ``['PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
+                                            'SOPInstanceUID']``
 
             Any columns used in ``filters`` that exist in the metadata are also included.
         **filters :
@@ -1341,17 +951,15 @@ class DICOMLoader:
         if df_filters:
             shortlist_df = self.query(query_level, **df_filters)
 
+        # No deep stage: projection/uniq & return
         if dcm_filters is None:
-            # No deep stage; just project/uniq at requested level and return
             level_cols = levels[ql]
+            filter_keys = (df_filters or {}).keys()
             # carry any df_filter columns, when present in DF
-            extra = [
-                c
-                for c in (df_filters or {}).keys()
-                if c in shortlist_df.columns and c not in level_cols
-            ]
+            extra = [c for c in filter_keys if c in shortlist_df.columns and c not in level_cols]
             out_cols = list(dict.fromkeys(level_cols + extra))
             df_out = shortlist_df[out_cols].copy()
+
             for col in df_out.columns:
                 if df_out[col].apply(lambda x: isinstance(x, list)).any():
                     df_out[col] = df_out[col].apply(
@@ -1426,23 +1034,99 @@ class DICOMLoader:
             empty = shortlist_df.iloc[0:0]
             return (deep_hits, empty) if (return_instances or return_paths) else empty
 
-        # Build the final DF for requested level using global metadata (stable)
-        df_hits = self.metadata_df[self.metadata_df["SOPInstanceUID"].astype(str).isin(hit_sops)]
+        # Build the final DF and populate extra columns
+        # Start from all metadata rows for the hit SOPs
+        df_hits = self.metadata_df[
+            self.metadata_df["SOPInstanceUID"].astype(str).isin(hit_sops)
+        ].copy()
 
         level_cols = levels[ql]
-        # Carry any referenced columns that happen to be in metadata_df;
-        # deep-only keys won’t be present
-        extra_cols = [
-            c
-            for c in (df_filters or {}).keys()
-            if c in self.metadata_df.columns and c not in level_cols
-        ]
+
+        filter_keys = set((df_filters or {}).keys()) | set((dcm_filters or {}).keys())
+
+        # Split into metada-backed vs deep-only keys
+        df_backed_keys = [k for k in filter_keys if k in self.metadata_df.columns]
+        deep_only_keys = [k for k in filter_keys if k not in self.metadata_df.columns]
+
+        # Ensure columns exist for deep-only keys (initially None)
+        for key in deep_only_keys:
+            if key not in df_hits.columns:
+                df_hits[key] = None
+
+        # SOP -> row index mapping (for df_hits)
+        sop_to_idx = {str(sop): idx for idx, sop in df_hits["SOPInstanceUID"].astype(str).items()}
+
+        # Prepare specific_tags for deep-only keys to keep reads light
+        from rosamllib.nodes.query_dicom import _specific_tags_from_filters, _iter_field_values
+
+        keys_for_tags = list(deep_only_keys)
+        # If we only have file paths, we need to read SOPInstanceUID from the dataset too
+        if return_paths and "SOPInstanceUID" not in keys_for_tags:
+            keys_for_tags.append("SOPInstanceUID")
+
+        spec_tags = _specific_tags_from_filters(keys_for_tags) if keys_for_tags else None
+
+        # Helper to read a dataset for deep-only extraction
+        def _read_ds_for_paths(path: str) -> Optional[pydicom.Dataset]:
+            try:
+                return pydicom.dcmread(
+                    path,
+                    stop_before_pixels=dcm_options.stop_before_pixels,
+                    force=True,
+                    specific_tags=spec_tags if spec_tags else None,
+                )
+            except Exception:
+                return None
+
+        # For each deep hit, extract values for deep-only keys and populate df_hits
+        for hit in deep_hits:
+            if return_paths:
+                path = hit
+                ds = _read_ds_for_paths(path)
+                if ds is None:
+                    continue
+                sop = str(getattr(ds, "SOPInstanceUID", ds.get("SOPInstanceUID", "")))
+            else:
+                inst = hit
+                path = inst.FilePath
+                # We already know the SOPInstanceUID from the node; no need to read it from ds
+                sop = str(getattr(inst, "SOPInstanceUID", ""))
+                if not sop:
+                    continue
+                ds = _read_ds_for_paths(path)
+                if ds is None:
+                    continue
+
+            if not sop:
+                continue
+
+            row_idx = sop_to_idx.get(sop)
+            if row_idx is None:
+                continue
+
+            for key in deep_only_keys:
+                try:
+                    vals = list(_iter_field_values(ds, key))
+                except Exception:
+                    vals = []
+                if not vals:
+                    value = None
+                elif len(vals) == 1:
+                    value = vals[0]
+                else:
+                    value = vals
+                df_hits.at[row_idx, key] = value
+
+        # Project to requested level + all filter-derived columns
+        extra_cols = [c for c in (df_backed_keys + deep_only_keys) if c not in level_cols]
         out_cols = list(dict.fromkeys(level_cols + extra_cols))
         df_out = df_hits[out_cols].copy()
 
+        # Normalize list-valued columns for stability
         for col in df_out.columns:
             if df_out[col].apply(lambda x: isinstance(x, list)).any():
                 df_out[col] = df_out[col].apply(lambda x: tuple(x) if isinstance(x, list) else x)
+
         df_out = df_out.drop_duplicates().reset_index(drop=True)
 
         if return_instances or return_paths:
@@ -2041,7 +1725,13 @@ class DICOMLoader:
             ]
         elif modality == "RTIMAGE":
             return [
-                RTIMAGE(dcmread(instance_path)) for instance_path in found_series.instance_paths
+                RTImageReader(instance_path).read()
+                for instance_path in found_series.instance_paths
+            ]
+        elif modality == "RAW":
+            return [
+                DICOMRawReader(dcmread(instance_path)).read()
+                for instance_path in found_series.instance_paths
             ]
 
         else:
@@ -2113,8 +1803,12 @@ class DICOMLoader:
 
         elif modality == "SEG":
             return SEGReader(filepath).read()
+
         elif modality == "RTIMAGE":
-            return RTIMAGE(dcmread(filepath))
+            return RTImageReader(filepath).read()
+
+        elif modality == "RAW":
+            return DICOMRawReader(filepath).read()
 
         else:
             raise NotImplementedError(f"A reader for {modality} type is not implemented yet.")
@@ -2175,89 +1869,7 @@ class DICOMLoader:
         - `include_start=False` by default (doesn't include the input `node` in results).
         """
 
-        def norm_modalities(m) -> Optional[Set[str]]:
-            if m is None:
-                return None
-            if isinstance(m, str):
-                return {m.upper()}
-            return {str(x).upper() for x in m}
-
-        def modality_ok(obj) -> bool:
-            if wanted is None:
-                return True
-            mod = getattr(obj, "Modality", None)
-            return (mod or "").upper() in wanted
-
-        def maybe_add(n):
-            if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
-                out.append(n)
-            elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
-                out.append(n)
-
-        level = level.upper()
-        if level not in {"INSTANCE", "SERIES"}:
-            raise ValueError("level must be 'INSTANCE' or 'SERIES'")
-
-        wanted = norm_modalities(modality)
-        out: List[Union[SeriesNode, InstanceNode]] = []
-        seen: Set[int] = set()
-
-        # BFS
-        q = deque()
-        # depth=0 is the start node; we still may include it if requested
-        q.append((node, 0))
-        if include_start:
-            maybe_add(node)
-
-        max_depth = None if recursive else 1
-
-        while q:
-            n, d = q.popleft()
-            nid = id(n)
-            if nid in seen:
-                continue
-            seen.add(nid)
-
-            # collect (except the start if include_start=False)
-            if d > 0:
-                maybe_add(n)
-
-            # stop expanding if we've hit the depth limit
-            if max_depth is not None and d >= max_depth:
-                continue
-
-            # neighbors
-            if isinstance(n, SeriesNode):
-                # 1) direct series->series links (e.g., REG/SEG edges resolved at series level)
-                for s in getattr(n, "referenced_series", []) or []:
-                    q.append((s, d + 1))
-                # 2) go through instances to follow instance-level links
-                for inst in getattr(n, "instances", {}).values():
-                    # instance->instance
-                    for ref in getattr(inst, "referenced_instances", []) or []:
-                        q.append((ref, d + 1))
-                    # instance->series
-                    for s in getattr(inst, "referenced_series", []) or []:
-                        q.append((s, d + 1))
-
-            elif isinstance(n, InstanceNode):
-                # instance->instance
-                for ref in getattr(n, "referenced_instances", []) or []:
-                    q.append((ref, d + 1))
-                # instance->series
-                for s in getattr(n, "referenced_series", []) or []:
-                    q.append((s, d + 1))
-
-        # de-dup while preserving order (by id)
-        seen_ids = set()
-        deduped = []
-        for x in out:
-            xid = id(x)
-            if xid not in seen_ids:
-                seen_ids.add(xid)
-                deduped.append(x)
-
-        return deduped
+        return get_referenced_nodes(node, modality, level, recursive, include_start)
 
     @staticmethod
     def get_referencing_nodes(
@@ -2315,99 +1927,7 @@ class DICOMLoader:
         ...                                           modality="RTDOSE")
         """
 
-        def norm_modalities(m) -> Optional[Set[str]]:
-            if m is None:
-                return None
-            if isinstance(m, str):
-                return {m.upper()}
-            return {str(x).upper() for x in m}
-
-        def modality_ok(obj) -> bool:
-            if wanted is None:
-                return True
-            mod = getattr(obj, "Modality", None)
-            return (mod or "").upper() in wanted
-
-        def maybe_add(n):
-            if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
-                out.append(n)
-            elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
-                out.append(n)
-
-        def enqueue(nei, depth):
-            if nei is None:
-                return
-            q.append((nei, depth))
-
-        level = level.upper()
-        if level not in {"INSTANCE", "SERIES"}:
-            raise ValueError("level must be 'INSTANCE' or 'SERIES'")
-
-        wanted = norm_modalities(modality)
-        out: List[Union[SeriesNode, InstanceNode]] = []
-        seen: Set[int] = set()
-        q = deque()
-        q.append((node, 0))
-        if include_start:
-            maybe_add(node)
-
-        max_depth = None if recursive else 1
-
-        while q:
-            n, d = q.popleft()
-            nid = id(n)
-            if nid in seen:
-                continue
-            seen.add(nid)
-
-            # collect (except depth 0 unless include_start)
-            if d > 0:
-                maybe_add(n)
-
-            # stop expanding if depth cap
-            if max_depth is not None and d >= max_depth:
-                continue
-
-            # ---- incoming neighbors ----
-            if isinstance(n, InstanceNode):
-                # instances that reference this instance
-                for rin in getattr(n, "referencing_instances", []) or []:
-                    enqueue(rin, d + 1)
-                    # their parent series are also referrers at the series level
-                    enqueue(getattr(rin, "parent_series", None), d + 1)
-
-                # series that reference this instance directly (if you maintain such a list)
-                # Not standard in your model; typically we discover series via the instances above.
-
-                # the instance's parent series might be referenced by other series;
-                # climb to series and continue
-                ps = getattr(n, "parent_series", None)
-                if ps is not None:
-                    # series that reference this series (if populated)
-                    for rs in getattr(ps, "referencing_series", []) or []:
-                        enqueue(rs, d + 1)
-
-            elif isinstance(n, SeriesNode):
-                # series that reference this series (if populated)
-                for rs in getattr(n, "referencing_series", []) or []:
-                    enqueue(rs, d + 1)
-
-                # instances that reference any instance within this series
-                for inst in getattr(n, "instances", {}).values():
-                    for rin in getattr(inst, "referencing_instances", []) or []:
-                        enqueue(rin, d + 1)
-                        enqueue(getattr(rin, "parent_series", None), d + 1)
-
-        # stable de-dup by object id
-        uniq_ids = set()
-        deduped = []
-        for x in out:
-            xid = id(x)
-            if xid not in uniq_ids:
-                uniq_ids.add(xid)
-                deduped.append(x)
-
-        return deduped
+        return get_referencing_nodes(node, modality, level, recursive, include_start)
 
     @staticmethod
     def get_frame_registered_nodes(
@@ -2428,121 +1948,14 @@ class DICOMLoader:
         - (if derive_frame_from_references) FoR of any series referenced by its instances
         """
 
-        def _wanted_set(m):
-            if m is None:
-                return None
-            return {m.upper()} if isinstance(m, str) else {str(x).upper() for x in m}
-
-        def _series_mod_ok(s):
-            return wanted is None or (getattr(s, "Modality", None) or "").upper() in wanted
-
-        def _inst_mod_ok(i):
-            return wanted is None or (getattr(i, "Modality", None) or "").upper() in wanted
-
-        def _effective_fors(series: SeriesNode) -> set[str]:
-            fors: set[str] = set()
-            fo_direct = getattr(series, "FrameOfReferenceUID", None)
-            if fo_direct:
-                fors.add(str(fo_direct))
-            if derive_frame_from_references:
-                for inst in getattr(series, "instances", {}).values():
-                    for u in getattr(inst, "FrameOfReferenceUIDs", []) or []:
-                        if u:
-                            fors.add(str(u))
-                    for rs in getattr(inst, "referenced_series", []) or []:
-                        u = getattr(rs, "FrameOfReferenceUID", None)
-                        if u:
-                            fors.add(str(u))
-            return fors
-
-        lvl = str(level).upper()
-        if lvl not in {"SERIES", "INSTANCE"}:
-            raise ValueError("level must be 'SERIES' or 'INSTANCE'")
-
-        wanted = _wanted_set(modality)
-
-        # Anchor series + anchor FoR set
-        anchor_series = (
-            node if isinstance(node, SeriesNode) else getattr(node, "parent_series", None)
+        return get_frame_registered_nodes(
+            node,
+            level=level,
+            include_self=include_self,
+            modality=modality,
+            dicom_files=dicom_files,
+            derive_frame_from_references=derive_frame_from_references,
         )
-        anchor_fors: set[str] = set()
-        if isinstance(node, InstanceNode) and getattr(node, "FrameOfReferenceUIDs", None):
-            anchor_fors |= {str(u) for u in (node.FrameOfReferenceUIDs or []) if u}
-        if anchor_series and getattr(anchor_series, "FrameOfReferenceUID", None):
-            anchor_fors.add(str(anchor_series.FrameOfReferenceUID))
-        # If still empty and we’re allowed to derive, derive from anchor series’ instances
-        if not anchor_fors and anchor_series and derive_frame_from_references:
-            anchor_fors |= _effective_fors(anchor_series)
-
-        if not anchor_fors:
-            # no FoR context — return only self if requested
-            if include_self:
-                if lvl == "SERIES" and isinstance(node, SeriesNode) and _series_mod_ok(node):
-                    return [node]
-                if lvl == "INSTANCE" and isinstance(node, InstanceNode) and _inst_mod_ok(node):
-                    return [node]
-            return []
-
-        # Collect peer series: intersection of effective FoRs with anchor_fors
-        peer_series: list[SeriesNode] = []
-        seen_sid: set[int] = set()
-
-        # Prefer dicom_files when provided (covers RTSTRUCT/SEG/REG cases correctly)
-        if dicom_files:
-            for _pid, sdict in dicom_files.items():
-                for s in sdict.values():
-                    if anchor_series is not None and s is anchor_series:
-                        continue
-                    eff = _effective_fors(s)
-                    if eff and (eff & anchor_fors):
-                        if id(s) not in seen_sid:
-                            peer_series.append(s)
-                            seen_sid.add(id(s))
-        else:
-            # Fallback to precomputed FoR neighbors (series-level only; may miss RTSTRUCT)
-            if anchor_series:
-                for s in list(getattr(anchor_series, "frame_of_reference_registered", []) or []):
-                    if id(s) in seen_sid:
-                        continue
-                    # verify intersection using effective FoRs to avoid false negatives
-                    if _effective_fors(s) & anchor_fors:
-                        peer_series.append(s)
-                        seen_sid.add(id(s))
-
-        if lvl == "SERIES":
-            out = []
-            if include_self and anchor_series and _series_mod_ok(anchor_series):
-                out.append(anchor_series)
-            out.extend([s for s in peer_series if _series_mod_ok(s)])
-            # de-dup
-            seen = set()
-            dedup = []
-            for x in out:
-                if id(x) not in seen:
-                    seen.add(id(x))
-                    dedup.append(x)
-            return dedup
-
-        # INSTANCE level: return instances from anchor (optional) + peer series
-        out_i: list[InstanceNode] = []
-
-        def add_series(series: SeriesNode):
-            for inst in getattr(series, "instances", {}).values():
-                if _inst_mod_ok(inst):
-                    out_i.append(inst)
-
-        if include_self and anchor_series:
-            add_series(anchor_series)
-        for s in peer_series:
-            add_series(s)
-
-        seen = set()
-        dedup = []
-        for x in out_i:
-            if id(x) not in seen:
-                seen.add(id(x))
-                dedup.append(x)
-        return dedup
 
     def get_frame_registered_clusters(
         self,
@@ -2731,596 +2144,88 @@ class DICOMLoader:
         ValueError
             If `level` is not one of {"STUDY", "SERIES", "INSTANCE"}.
         """
-        level = level.upper()
-        if level not in {"STUDY", "SERIES", "INSTANCE"}:
-            raise ValueError("level must be 'STUDY', 'SERIES', or 'INSTANCE'")
-
-        results = []
-
-        for study_node in patient_node:
-            if level == "STUDY":
-                if uid and study_node.StudyInstanceUID != uid:
-                    continue
-                results.append(study_node)
-
-            elif level == "SERIES":
-                for series_node in study_node:
-                    if uid and series_node.SeriesInstanceUID != uid:
-                        continue
-                    if modality and series_node.Modality != modality:
-                        continue
-                    results.append(series_node)
-
-            elif level == "INSTANCE":
-                for series_node in study_node:
-                    for instance_node in series_node:
-                        if uid and instance_node.SOPInstanceUID != uid:
-                            continue
-                        if modality and instance_node.Modality != modality:
-                            continue
-                        results.append(instance_node)
-
-        return results
+        return get_nodes_for_patient(
+            patient_node,
+            level=level,
+            modality=modality,
+            uid=uid,
+        )
 
     def visualize_series_references(
         self,
-        patient_id=None,
+        patient_id,
         output_file=None,
         view=True,
-        per_patient=False,
         exclude_modalities=None,
         exclude_series=[],
         include_uid=False,
         rankdir="BT",
+        *,
+        output_format="svg",
+        return_graph="none",
     ):
         """
-        Visualizes the series-level associations for all patients or a specific patient using
-        Graphviz. Each series is represented as a box, and an edge is drawn from a series to its
-        referenced series. The patient ID will be the top node, followed by root series (e.g., CT)
-        and referenced series (e.g., RTDOSE).
+        Visualize series-level (instance-level for DICOM-RT) associations for a single patient
+        using Graphviz.
+
+        Each series is represented as a box, and edges are drawn from a series (or instance)
+        to the series/instance it references. The patient node sits at the top, with study
+        subgraphs grouping series. Embedded RAW contents are shown as nested subgraphs.
 
         Parameters
         ----------
-        patient_id : str or None, optional
-            If provided, only generates the graph for the specified patient. This takes priority
-            over `per_patient`.
+        patient : PatientNode
+            The patient object to visualize. (Pass exactly one patient.)
         output_file : str or None, optional
-            The name of the output file for the graph visualization. If None, the graph will not
-            be saved. If `per_patient=True`, this will serve as a prefix for the patient-specific
-            files.
+            If provided, saves the rendered graph to '{output_file}_{patient.PatientID}.{ext}'.
+            Use `output_format` to choose the file format. If None, nothing is written.
         view : bool, optional
-            Whether to automatically view the graph after it's generated using `matplotlib` or
-            another viewer.
-        per_patient : bool, optional
-            Whether to create separate graphs for each patient. If False, all patients are
-            visualized in one graph.
-        exclude_modalities : list of str, optional
-            A list of modalities to exclude from the visualization. If None, all modalities are
-            included.
-        exclude_series : list of str, optional
-            A list of SeriesInstanceUIDs to exclude from the graph. If None or empty, no series
-            are excluded.
+            Whether to display the graph after generation. In Jupyter, shows SVG inline;
+            otherwise opens a Matplotlib window with a PNG rendering.
+        exclude_modalities : list[str] or str or None, optional
+            Modalities to exclude (e.g., ["RTRECORD", "RAW"]). If a string is supplied, it
+            is treated as a single-item list.
+        exclude_series : list[str] or None, optional
+            SeriesInstanceUIDs to exclude from the graph.
         include_uid : bool, optional
-            Whether to include the (SOP/Series)InstanceUID in the label for each node.
-        rankdir : str, optional
-            The direction of the graph layout. Must be one of ['RL', 'LR', 'BT', 'TB'].
-
+            If True, node labels include (SOP/Series)InstanceUIDs.
+        rankdir : {'RL','LR','BT','TB'}, optional
+            Graph layout direction (default: 'BT' = bottom-to-top).
+        output_format : {'svg','png'}, keyword-only, optional
+            File format used when writing to disk (via `output_file`). Default: 'svg'.
+        return_graph : {'none','graph','dot','svg','png'}, keyword-only, optional
+            Controls what the function returns:
+            - 'none'  : return None
+            - 'graph' : return the graphviz.Digraph object
+            - 'dot'   : return the DOT source string (str)
+            - 'svg'   : return SVG bytes
+            - 'png'   : return PNG bytes
 
         Returns
         -------
-        None
+        object or bytes or str or None
+            Depending on `return_graph`:
+            - 'none'  -> None
+            - 'graph' -> graphviz.Digraph
+            - 'dot'   -> str (DOT)
+            - 'svg'   -> bytes (SVG)
+            - 'png'   -> bytes (PNG)
         """
-        if rankdir not in ["RL", "LR", "BT", "TB"]:
-            raise ValueError(f"{rankdir} is not a valid option for rankdir")
-
-        # define color mappings based on modality
-        modality_colors = {
-            "CT": "lightsteelblue",
-            "MR": "lightseagreen",
-            "PT": "lightcoral",
-            "RTSTRUCT": "navajowhite",
-            "RTPLAN": "lightgoldenrodyellow",
-            "RTDOSE": "lightpink",
-            "RTRECORD": "lavender",
-            "REG": "thistle",
-            "SEG": "peachpuff",
-            "DEFAULT": "lightgray",
-        }
-        patient_color = "dodgerblue"
-        raw_subgraph_color = "lightcyan"
-
-        def study_color_generator():
-            study_subgraph_colors = [
-                "honeydew",
-                "lavenderblush",
-                "azure",
-                "seashell",
-                "mintcream",
-                "mistyrose",
-                "aliceblue",
-                "powderblue",
-                "oldlace",
-            ]
-            while True:
-                for color in study_subgraph_colors:
-                    yield color
-
-        def get_modality_color(modality):
-            """
-            Helper function to get the background color based on the modality.
-            """
-            return modality_colors.get(modality, modality_colors["DEFAULT"])
-
-        def get_referenced_series(series):
-            referenced_series = list()
-            for sop_uid, instance in series.instances.items():
-                if instance.referenced_sids:
-                    for ref_sid in instance.referenced_sids:
-                        ref_series = self.get_series(ref_sid)
-                        if ref_series:
-                            referenced_series.append(ref_series)
-
-            return referenced_series
-
-        def get_other_referenced_series(series):
-            referenced_series = list()
-            for sop_uid, instance in series.instances.items():
-                if instance.other_referenced_sids:
-                    for ref_sid in instance.other_referenced_sids:
-                        ref_series = self.get_series(ref_sid)
-                        if ref_series:
-                            referenced_series.append(ref_series)
-
-            return referenced_series
-
-        def get_frame_registered_image_series(series):
-            referenced_series = set()
-            for series in series.frame_of_reference_registered:
-                if series.Modality in ["CT", "MR", "PT"]:
-                    referenced_series.add(series)
-            return referenced_series
-
-        def exclude_referenced(
-            series, exclude_modalities=exclude_modalities, exclude_series=exclude_series
-        ):
-            if exclude_modalities and series.Modality in exclude_modalities:
-                return True
-            if exclude_series and series.SeriesInstanceUID in exclude_series:
-                return True
-            return False
-
-        def create_graph(patient_id, series_dict, graph):
-            """
-            Helper function to create a graph for a specific patient.
-            """
-            # Add patient ID as the top node for each patient's graph
-            graph.node(
-                patient_id,
-                label=(
-                    f"Patient ID: {patient_id}\n"
-                    f"{series_dict[list(series_dict.keys())[0]].PatientName}"
-                ),
-                fillcolor=patient_color,
-                style="filled",
-            )
-            # group series based on their study instance uid
-            grouped_series = {}
-            for series_uid, series in series_dict.items():
-                if series.StudyInstanceUID:
-                    study_uid = series.StudyInstanceUID
-                    if study_uid not in grouped_series:
-                        grouped_series[study_uid] = {}
-                    grouped_series[study_uid][series_uid] = series
-                else:
-                    if "UNK" not in grouped_series:
-                        grouped_series["UNK"] = {}
-                    grouped_series["UNK"][series_uid] = series
-
-            # for each group draw subgraph
-            all_nodes_set = set()
-            referencing_nodes_set = set()
-            color_cycle = study_color_generator()
-
-            # first pass: create nodes only
-            for study_uid, grouped in grouped_series.items():
-                first_sid = next(iter(grouped))
-                first_series = grouped[first_sid]
-                study_desc = first_series.StudyDescription
-                ct_mr_pt_nodes = []
-                with graph.subgraph(name=f"cluster_{study_uid}") as study_graph:
-                    if include_uid:
-                        label_rg = (
-                            f"StudyDescription: {study_desc}" f"\nStudyInstanceUID: {study_uid}"
-                        )
-
-                    else:
-                        label_rg = f"StudyDescription: {study_desc}"
-
-                    label_loc = "b" if rankdir == "BT" else "t"
-                    # label_loc = "t"
-                    study_subgraph_color = next(color_cycle)
-                    study_graph.attr(
-                        label=label_rg,
-                        labelloc=label_loc,
-                        color="black",
-                        style="filled",
-                        fillcolor=study_subgraph_color,
-                    )
-                    for series_uid, series in grouped.items():
-
-                        # Exclude modalities if specified
-                        if exclude_modalities and series.Modality in exclude_modalities:
-                            continue
-
-                        if series.SeriesInstanceUID in exclude_series:
-                            continue
-
-                        if series.Modality == "RAW":
-                            continue
-
-                        if exclude_modalities and "RAW" in exclude_modalities:
-                            if series.is_embedded_in_raw:
-                                continue
-
-                        if series.Modality in ["CT", "MR", "PT"]:
-                            ct_mr_pt_nodes.append(series.SeriesInstanceUID)
-
-                        # get the color based on modality
-                        node_color = get_modality_color(series.Modality)
-
-                        # handle embedded series in RAW
-                        if series.is_embedded_in_raw:
-                            # create another subgraph for the embedded series within the RAW series
-                            with study_graph.subgraph(
-                                name=f"cluster_{series.raw_series_reference.SeriesInstanceUID}"
-                            ) as raw_graph:
-                                if include_uid:
-                                    label_r = (
-                                        f"MIM Session: "
-                                        f"{series.raw_series_reference.SeriesDescription}"
-                                        "\nSeriesInstanceUID: "
-                                        f"{series.raw_series_reference.SeriesInstanceUID}"
-                                    )
-                                else:
-                                    label_r = (
-                                        "MIM Session: "
-                                        f"{series.raw_series_reference.SeriesDescription}"
-                                    )
-                                raw_graph.attr(
-                                    label=label_r,
-                                    color="black",
-                                    style="filled",
-                                    fillcolor=raw_subgraph_color,
-                                )
-
-                                # italicize the embedded series
-                                if include_uid:
-                                    label = (
-                                        f"{series.Modality}: {series.SeriesDescription}"
-                                        f"\n{series.SeriesInstanceUID}"
-                                    )
-                                else:
-                                    label = f"{series.Modality}: {series.SeriesDescription}"
-                                raw_graph.node(
-                                    series.SeriesInstanceUID,
-                                    label=label,
-                                    shape="box",
-                                    style="filled",
-                                    fontcolor="black",
-                                    fontname="Times-Italic",
-                                    fillcolor=node_color,
-                                )
-                                all_nodes_set.add(series.SeriesInstanceUID)
-                        else:
-                            if series.Modality in [
-                                "RTSTRUCT",
-                                "RTPLAN",
-                                "RTDOSE",
-                                "RTRECORD",
-                                "SEG",
-                            ]:
-                                # Add each instance separately as a node
-                                for sop_uid, instance in series.instances.items():
-                                    if include_uid:
-                                        label = (
-                                            f"{series.Modality}: {series.SeriesDescription}"
-                                            f"\nSOPInstanceUID: {sop_uid}"
-                                        )
-                                    else:
-                                        label = f"{series.Modality}: {series.SeriesDescription}"
-                                    node_color = get_modality_color(series.Modality)
-                                    study_graph.node(
-                                        sop_uid,
-                                        label=label,
-                                        style="filled",
-                                        fillcolor=node_color,
-                                    )
-                                    all_nodes_set.add(sop_uid)
-
-                            else:
-                                # Add each series as a node (box)
-                                if include_uid:
-                                    label = (
-                                        f"{series.Modality}: {series.SeriesDescription}"
-                                        f"\nSeriesInstanceUID: {series.SeriesInstanceUID}"
-                                    )
-                                else:
-                                    label = f"{series.Modality}: {series.SeriesDescription}"
-                                node_color = get_modality_color(series.Modality)
-                                study_graph.node(
-                                    series.SeriesInstanceUID,
-                                    label=label,
-                                    style="filled",
-                                    fillcolor=node_color,
-                                )
-                                all_nodes_set.add(series.SeriesInstanceUID)
-
-                    # Enforce same rank for CT, MR, PT
-                    if ct_mr_pt_nodes:
-                        with study_graph.subgraph() as same_rank:
-                            same_rank.attr(rank="same")
-                            for node in ct_mr_pt_nodes:
-                                same_rank.node(node)
-            # second pass: add edges based on references
-            for study_uid, grouped in grouped_series.items():
-                if study_uid != "UNK":
-                    for series_uid, series in grouped.items():
-                        # Exclude modalities if specified
-                        if exclude_modalities and series.Modality in exclude_modalities:
-                            continue
-
-                        if series.SeriesInstanceUID in exclude_series:
-                            continue
-
-                        if series.Modality == "RAW":
-                            continue
-
-                        if exclude_modalities and "RAW" in exclude_modalities:
-                            if series.is_embedded_in_raw:
-                                continue
-
-                        if series.is_embedded_in_raw:
-                            continue
-
-                        if series.Modality in [
-                            "RTSTRUCT",
-                            "RTPLAN",
-                            "RTDOSE",
-                            "RTRECORD",
-                            "SEG",
-                        ]:
-                            # Add each instance separately as a node
-                            for sop_uid, instance in series.instances.items():
-                                # Check for direct references to other nodes
-                                if series.Modality in ["RTSTRUCT", "SEG"]:
-                                    referenced_series_list = instance.referenced_series
-                                    if referenced_series_list:
-                                        for referenced_series in referenced_series_list:
-                                            if not exclude_referenced(referenced_series):
-                                                referencing_nodes_set.add(instance.SOPInstanceUID)
-
-                                                # Draw an edge pointing *upwards* from the
-                                                # referenced node to the referencing node
-                                                graph.edge(
-                                                    instance.SOPInstanceUID,
-                                                    referenced_series.SeriesInstanceUID,
-                                                )
-                                    else:
-                                        # Check for FrameOfReference registeration
-                                        if series.frame_of_reference_registered:
-                                            for (
-                                                frame_of_ref_series
-                                            ) in series.frame_of_reference_registered:
-                                                if frame_of_ref_series.Modality in [
-                                                    "CT",
-                                                    "MR",
-                                                    "PT",
-                                                ]:
-                                                    if not exclude_referenced(frame_of_ref_series):
-                                                        referencing_nodes_set.add(
-                                                            instance.SOPInstanceUID
-                                                        )
-
-                                                        graph.edge(
-                                                            instance.SOPInstanceUID,
-                                                            frame_of_ref_series.SeriesInstanceUID,
-                                                            style="dashed",
-                                                        )
-                                                        break
-                                else:
-                                    referenced_instances_list = instance.referenced_instances
-                                    if referenced_instances_list:
-                                        for referenced_instance in referenced_instances_list:
-                                            if not exclude_referenced(
-                                                referenced_instance.parent_series
-                                            ):
-                                                referencing_nodes_set.add(instance.SOPInstanceUID)
-
-                                                # Draw an edge pointing *upwards* from the
-                                                # referenced node to the referencing node
-                                                graph.edge(
-                                                    instance.SOPInstanceUID,
-                                                    referenced_instance.SOPInstanceUID,
-                                                )
-                                    else:
-                                        # Check if FrameOfReference registration
-                                        if series.frame_of_reference_registered:
-                                            for (
-                                                frame_of_ref_series
-                                            ) in series.frame_of_reference_registered:
-                                                if frame_of_ref_series.Modality in [
-                                                    "CT",
-                                                    "MR",
-                                                    "PT",
-                                                ]:
-                                                    if not exclude_referenced(frame_of_ref_series):
-                                                        referencing_nodes_set.add(
-                                                            instance.SOPInstanceUID
-                                                        )
-                                                        graph.edge(
-                                                            instance.SOPInstanceUID,
-                                                            frame_of_ref_series.SeriesInstanceUID,
-                                                            style="dashed",
-                                                        )
-                                                        break
-                        else:
-                            # Check if the series references another series directly
-                            referenced_series_set = get_referenced_series(series)
-                            if referenced_series_set:
-                                referenced_series = referenced_series_set[0]
-                                if not exclude_referenced(referenced_series):
-                                    referenced_series_uid = referenced_series.SeriesInstanceUID
-                                    referencing_nodes_set.add(series.SeriesInstanceUID)
-
-                                    # Draw an edge pointing *upwards* from the referenced series
-                                    # to the referencing series
-                                    graph.edge(
-                                        series.SeriesInstanceUID,
-                                        referenced_series_uid,
-                                    )
-                            else:
-                                # Check if the series references other instances directly
-                                referenced_instances = self.get_referenced_nodes(
-                                    series, level="INSTANCE", recursive=False
-                                )
-                                if referenced_instances:
-                                    for ref_inst in referenced_instances:
-                                        if not exclude_referenced(ref_inst.parent_series):
-                                            referencing_nodes_set.add(ref_inst.SOPInstanceUID)
-
-                                            # Draw an edge pointing *upwards* from the
-                                            # referenced node to the referencing node
-                                            graph.edge(
-                                                series.SeriesInstanceUID,
-                                                ref_inst.SOPInstanceUID,
-                                            )
-
-                            # Check for REG modality and moving image reference
-                            # (other_referenced_sid)
-                            if series.Modality == "REG":
-                                other_referenced_series_set = get_other_referenced_series(series)
-                                if other_referenced_series_set:
-                                    other_referenced_series = other_referenced_series_set[0]
-                                    if not exclude_referenced(other_referenced_series):
-                                        referencing_nodes_set.add(series.SeriesInstanceUID)
-                                        # Draw a dashed blue edge for the REG moving image
-                                        # reference
-                                        graph.edge(
-                                            series.SeriesInstanceUID,
-                                            other_referenced_series.SeriesInstanceUID,
-                                            style="dotted",
-                                        )
-
-            # Root nodes are those that don't reference other series
-            root_nodes = all_nodes_set - referencing_nodes_set
-
-            # Connect the patient node to the root series nodes
-            for root in root_nodes:
-                graph.edge(
-                    root, patient_id, style="invis"
-                )  # Root points to the patient (arrows go up)
-
-            return graph
-
-        def display_graph_with_matplotlib(dot_source, dpi=1000):
-            """
-            Displays the Graphviz graph using matplotlib, by converting SVG to PNG.
-            """
-            # Generate the PNG in memory
-            graph_svg = graphviz.Source(dot_source)
-            png_data = graph_svg.pipe(format="png")
-
-            # Load the PNG into a Matplotlib plot
-            img = mpimg.imread(BytesIO(png_data), format="png")
-
-            # Display the PNG using matplotlib
-            plt.figure(figsize=(12, 12), dpi=dpi)  # Adjust figure size for large graphs
-            plt.imshow(img)
-            plt.axis("off")
-            plt.show()
-
-        def display_graph_in_jupyter(dot_source):
-            """
-            Displays the graph inline in a Jupyter notebook using IPython's display and SVG.
-            """
-            from IPython.display import display, SVG
-
-            graph_svg = graphviz.Source(dot_source)
-            svg = graph_svg.pipe(format="svg").decode("utf-8")
-            display(SVG(svg))
-
-            # display(SVG(graphviz.Source(dot_source).pipe(format="svg")))
-
-        is_jupyter = in_jupyter()
-
-        # if patient_id is specified, only generate for that patient
-        if patient_id is not None:
-            series_dict = self.dicom_files.get(patient_id, {})
-            if not series_dict:
-                print(f"No data found for patient {patient_id}")
-                return
-            graph = graphviz.Digraph(comment=f"DICOM Series Associations for {patient_id}")
-            graph.attr("node", shape="box", style="filled", fillcolor="lightgray", color="black")
-            graph.attr(rankdir=rankdir)
-
-            # Create a graph for the specified patient
-            graph = create_graph(patient_id, series_dict, graph)
-
-            # Render and view the graph for the specified patient
-            if output_file:
-                graph.render(f"{output_file}_{patient_id}", format="svg")
-
-            if view:
-                if is_jupyter:
-                    display_graph_in_jupyter(graph.source)
-                else:
-                    display_graph_with_matplotlib(graph.source)
-
-        elif per_patient:
-            # Create separate graphs for each patient
-            for patient_id, series_dict in self.dicom_files.items():
-                graph = graphviz.Digraph(comment=f"DICOM Series Associations for {patient_id}")
-                graph.attr(
-                    "node", shape="box", style="filled", fillcolor="lightgray", color="black"
-                )
-
-                graph.attr(rankdir=rankdir)
-
-                # Create a graph for each patient
-                graph = create_graph(patient_id, series_dict, graph)
-
-                # Render and view each patient's graph
-                if output_file:
-                    patient_output_file = f"{output_file}_{patient_id}.svg"
-                    graph.render(patient_output_file, format="svg")
-
-                if view:
-                    if is_jupyter:
-                        display_graph_in_jupyter(graph.source)
-                    else:
-                        display_graph_with_matplotlib(graph.source)
-
-        else:
-            # Create a combined graph for all patients
-            graph = graphviz.Digraph(comment="DICOM Series Associations")
-            graph.attr("node", shape="box", style="filled", fillcolor="lightgray", color="black")
-
-            graph.attr(rankdir=rankdir)
-
-            # Loop through all patients and their series
-            for patient_id, series_dict in self.dicom_files.items():
-                # Add each patient's series to the combined graph
-                graph = create_graph(patient_id, series_dict, graph)
-
-            # Render and view the combined graph
-            if output_file:
-                graph.render(output_file, format="svg")
-
-            if view:
-                if is_jupyter:
-                    display_graph_in_jupyter(graph.source)
-                else:
-                    display_graph_with_matplotlib(graph.source)
+        patient = self.get_patient(patient_id)
+        if not patient:
+            print(f"No data found for patient {patient_id}")
+            return
+        return visualize_series_references(
+            patient,
+            output_file=output_file,
+            view=view,
+            exclude_modalities=exclude_modalities,
+            exclude_series=exclude_series,
+            include_uid=include_uid,
+            rankdir=rankdir,
+            output_format=output_format,
+            return_graph=return_graph,
+        )
 
     def __iter__(self):
         """
