@@ -1,34 +1,51 @@
 import os
-import pydicom
 from pathlib import Path
+
+import pydicom
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
+
 from rosamllib.dicoms import RTPlan
 
 
 class RTPlanReader:
     """
-    A class for reading DICOM RTPLAN files from a file path, directory, or pydicom.Dataset.
-    The RTPlanReader class will return an instance of the RTPlan class, which contains methods
-    for extracting beam sequences, fraction details, and treatment parameters.
+    Reader class for loading DICOM RTPLAN (treatment plan) objects from disk or
+    an in-memory :class:`pydicom.Dataset`.
+
+    The reader accepts either:
+
+    - A file path to an RTPLAN DICOM file.
+    - A directory containing at least one RTPLAN file (scanned recursively).
+    - A pre-loaded :class:`pydicom.Dataset` whose Modality is ``"RTPLAN"`` (recommended).
+
+    The :meth:`read` method returns an instance of :class:`rosamllib.dicoms.RTPLAN`,
+    which subclasses :class:`pydicom.dataset.Dataset` and is intended to provide
+    convenience helpers for beam geometry, control points, dose prescriptions,
+    and referenced images/structures.
 
     Parameters
     ----------
-    rtplan_input : str or pydicom.Dataset
-        Path to the RTPLAN file, directory containing an RTPLAN file, or a pydicom.Dataset.
-
-    Methods
-    -------
-    read()
-        Reads the RTPLAN file or dataset and returns an instance of the RTPlan class.
+    rtplan_input : str, pathlib.Path, or pydicom.Dataset
+        A path to an RTPLAN file, a directory containing an RTPLAN file,
+        or an in-memory DICOM dataset.
 
     Examples
     --------
-    >>> reader = RTPlanReader("path/to/dicom/RTPLAN")
+    Reading from a file path:
+
+    >>> reader = RTPlanReader("path/to/RTPLAN.dcm")
     >>> rtplan = reader.read()
 
-    >>> dataset = pydicom.dcmread("path/to/dicom/RTPLAN.dcm")
-    >>> reader = RTPlanReader(dataset)
+    Reading from a directory:
+
+    >>> reader = RTPlanReader("/path/to/folder/")
+    >>> rtplan = reader.read()
+
+    Reading from an existing dataset:
+
+    >>> ds = pydicom.dcmread("path/to/RTPLAN.dcm")
+    >>> reader = RTPlanReader(ds)
     >>> rtplan = reader.read()
     """
 
@@ -37,74 +54,88 @@ class RTPlanReader:
         self.rtplan_dataset = None
 
         if isinstance(rtplan_input, (str, Path)):
-            # If rtplan_input is a file path or directory
+            # File path or directory
             self.rtplan_file_path = rtplan_input
         elif isinstance(rtplan_input, Dataset):
-            # If rtplan_input is a pre-loaded pydicom.Dataset
+            # Pre-loaded DICOM dataset
             self.rtplan_dataset = rtplan_input
         else:
             raise ValueError(
-                "rtplan_input must be either a file path (str), a directory, or a pydicom.Dataset."
+                "rtplan_input must be either a file path (str/Path), "
+                "a directory, or a pydicom.Dataset."
             )
 
-    def read(self):
+    def read(self) -> RTPlan:
         """
-        Reads the RTPLAN file or dataset and returns an instance of the RTPlan class.
+        Load the RTPLAN DICOM and return an initialized :class:`RTPlan` object.
 
-        If a file path is provided, it reads the file or searches for an RTPLAN file
-        in the directory. If a dataset is provided, it directly instantiates the RTPlan class.
+        Behavior
+        --------
+        • If initialized with a directory, scans recursively for the first file
+          whose Modality is ``'RTPLAN'`` (using ``stop_before_pixels=True``).
+        • If initialized with a file path, reads it via :func:`pydicom.dcmread`.
+        • If initialized with a Dataset, uses it directly.
 
         Returns
         -------
         RTPlan
-            An instance of the RTPlan class, initialized with the DICOM RTPLAN dataset.
+            A :class:`RTPlan` instance created via :meth:`RTPlan.from_dataset`.
 
         Raises
         ------
         IOError
-            If no RTPLAN file is found in the directory or if the file cannot be read.
+            If no RTPLAN file can be located when a directory is provided.
+        ValueError
+            If neither a file path nor dataset was supplied.
+        pydicom.errors.InvalidDicomError
+            If the target file is not a valid DICOM file.
         """
         if self.rtplan_file_path:
             if os.path.isdir(self.rtplan_file_path):
                 rtplan_file = self._find_rtplan_in_directory(self.rtplan_file_path)
                 if not rtplan_file:
                     raise IOError(f"No RTPLAN file found in directory: {self.rtplan_file_path}")
-                self.rtplan_dataset = pydicom.dcmread(rtplan_file)
+                ds = pydicom.dcmread(rtplan_file)
             else:
-                self.rtplan_dataset = pydicom.dcmread(self.rtplan_file_path)
-        elif not self.rtplan_dataset:
+                ds = pydicom.dcmread(self.rtplan_file_path)
+        elif self.rtplan_dataset is not None:
+            ds = self.rtplan_dataset
+        else:
             raise ValueError("No RTPLAN file path or dataset provided.")
 
-        return RTPlan(self.rtplan_dataset)
+        return RTPlan.from_dataset(ds)
 
     def _find_rtplan_in_directory(self, directory_path):
         """
-        Searches a directory for an RTPLAN file.
+        Recursively search a directory for the first valid DICOM RTPLAN file.
 
         Parameters
         ----------
-        directory_path : str
-            Path to the directory to search.
+        directory_path : str or Path
+            The directory in which to search for RTPLAN DICOM files.
 
         Returns
         -------
-        str
-            The path to the RTPLAN file if found, otherwise None.
+        str or None
+            The full path to the first discovered RTPLAN file, or ``None`` if
+            no valid RTPLAN dataset was found.
 
-        Raises
-        ------
-        InvalidDicomError
-            If no valid RTPLAN file is found.
+        Notes
+        -----
+        • Uses ``stop_before_pixels=True`` to keep directory scans fast.
+        • Any unreadable or non-DICOM files are silently skipped.
         """
+        directory_path = str(directory_path)
         for root, _, files in os.walk(directory_path):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
                     ds = pydicom.dcmread(file_path, stop_before_pixels=True)
-                    if ds.Modality == "RTPLAN":
+                    if getattr(ds, "Modality", None) == "RTPLAN":
                         return file_path
                 except InvalidDicomError:
                     continue
-                except Exception as e:
-                    print(f"Error reading file {file_path}: {e}")
+                except Exception:
+                    # Best-effort scan; unexpected errors are ignored
+                    pass
         return None
