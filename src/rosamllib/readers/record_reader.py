@@ -77,7 +77,7 @@ class RTRecordReader:
         elif not self.rtrecord_dataset:
             raise ValueError("No RTRECORD file path or dataset provided.")
 
-        return RTRecord(self.rtrecord_dataset)
+        return RTRecord.from_dataset(self.rtrecord_dataset)
 
     def _find_rtrecord_in_directory(self, directory_path):
         """
