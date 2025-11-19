@@ -7,3 +7,4 @@ from rosamllib.dicoms.rtrecord import RTRecord
 from rosamllib.dicoms.seg import SEG
 from rosamllib.dicoms.rtstruct_builder import RTStructBuilder
 from rosamllib.dicoms.rtimage import RTIMAGE
+from rosamllib.dicoms.raw import RAW
