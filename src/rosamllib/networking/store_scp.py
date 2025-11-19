@@ -35,7 +35,7 @@ def _mask(s: str | None, keep: int = 6) -> str | None:
     return s[:keep] + "..."
 
 
-def _ctx_from_event(event, op: str, mask_phi: bool = True):
+def _ctx_from_event(event, op: str, mask_phi: bool = True) -> Dict[str, str | None]:
     """Build structured logging context from a pynetdicom event."""
     assoc = getattr(event, "assoc", None)
     dset = getattr(event, "dataset", None)
@@ -44,13 +44,20 @@ def _ctx_from_event(event, op: str, mask_phi: bool = True):
 
     calling_ae = requestor.ae_title if requestor else None
     called_ae = acceptor.ae_title if acceptor else None
-    remote = getattr(event, "address", None)
-    hostport = f"{remote[0]}:{remote[1]}" if remote else None
+
+    if requestor is not None:
+        hostport = f"{requestor.address}:{requestor.port}"
+    else:
+        hostport = None
+    # remote = getattr(event, "address", None)
+    # hostport = f"{remote[0]}:{remote[1]}" if remote else None
 
     def get(attr: str):
         return getattr(dset, attr, None) if dset is not None else None
 
     val = (lambda x: _mask(x)) if mask_phi else (lambda x: x)
+
+    sop_class_uid = get("SOPClassUID")
 
     return {
         "op": op,
@@ -58,7 +65,7 @@ def _ctx_from_event(event, op: str, mask_phi: bool = True):
         "called_ae": called_ae,
         "remote_addr": hostport,
         "modality": get("Modality"),
-        "sop_class": str(get("SOPClassUID")),
+        "sop_class": str(sop_class_uid) if sop_class_uid is not None else None,
         "sop_uid": val(get("SOPInstanceUID")),
         "study_uid": val(get("StudyInstanceUID")),
         "series_uid": val(get("SeriesInstanceUID")),
@@ -179,7 +186,7 @@ class StoreSCP:
         self.ae.network_timeout = network_timeout
 
         self._server = None
-        self._server_running = None
+        self._server_running = False
 
         # Configure logger
         if logger is not None:
@@ -268,9 +275,10 @@ class StoreSCP:
             The status message to respond with
         """
         t0 = time.perf_counter()
-        extra = _ctx_from_event(event, "C-STORE", mask_phi=True)
 
         try:
+            extra = _ctx_from_event(event, "C-STORE", mask_phi=self._mask_phi_logs)
+
             # Run custom functions
             for func in list(self.custom_functions_store):
                 try:
@@ -304,10 +312,9 @@ class StoreSCP:
         self.handlers.append((evt.EVT_CONN_CLOSE, self.handle_close))
         self.handlers.append((evt.EVT_C_STORE, self.handle_store))
         self.handlers.append((evt.EVT_REQUESTED, self._on_assoc_requested))
-        self.handlers.append((evt.EVT_ACCEPTED, self._on_assoc_requested))
+        self.handlers.append((evt.EVT_ACCEPTED, self._on_assoc_accepted))
         self.handlers.append((evt.EVT_REJECTED, self._on_assoc_rejected))
         self.handlers.append((evt.EVT_ABORTED, self._on_abort))
-        self.handlers.append((evt.EVT_C_STORE, self.handle_store))
 
     def _on_assoc_requested(self, event):
         extra = _ctx_from_event(event, "ASSOC-REQ", mask_phi=self._mask_phi_logs)
@@ -573,7 +580,6 @@ class StoreSCP:
         --------
         >>> scp = StoreSCP(aet='MY_SCP', ip='127.0.0.1', port=11112)
         >>> scp.register_sop_class('1.2.246.352.70.1.70', 'VarianRTPlanStorage')
-        >>> scp.add_registered_presentation_context('VarianRTPlanStorage')
         """
         # Check if the SOP Class is already registered
         if not hasattr(sop_class, keyword):
@@ -605,7 +611,7 @@ class StoreSCP:
         Examples
         --------
         >>> scp = StoreSCP(aet='MY_SCP', ip='127.0.0.1', port=11112)
-        >>> scp.register_sop_class('1.2.246.352.70.1.70', 'VarianRTplanStorage')
+        >>> scp.register_sop_class('1.2.246.352.70.1.70', 'VarianRTPlanStorage')
         >>> scp.add_registered_presentation_context('VarianRTPlanStorage')
         """
         # Check if the SOP Class is registered
@@ -681,7 +687,7 @@ class StoreSCP:
 
         Returns
         -------
-        Dict[str, logging.Handlers]
+        Dict[str, logging.Handler]
             The handlers that were added, keyed by "console" and/or "file".
         """
         # formatter
@@ -689,7 +695,7 @@ class StoreSCP:
             formatter = build_formatter(human=not json_logs)
 
         # attach a context filter so evey log carries these fields
-        ctx = static_context or {"component": "QueryRetrieveSCU"}
+        ctx = static_context or {"component": self.__class__.__name__}
         # avoid adding the same filter multiple times
         if not any(isinstance(f, _ContextFilter) for f in self.logger.filters):
             self.logger.addFilter(_ContextFilter(**ctx))
@@ -747,7 +753,7 @@ class StoreSCP:
         _dedupe_handlers(self.logger)
         return added
 
-    def enable_wire_debu(self, enable: bool = True, level: int = logging.DEBUG):
+    def enable_wire_debug(self, enable: bool = True, level: int = logging.DEBUG):
         """Enable/disable verbose pynetdicom + route through our logger."""
         attach_pynetdicom_to_logger(enable, level)
 
