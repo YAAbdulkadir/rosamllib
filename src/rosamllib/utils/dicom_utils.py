@@ -58,9 +58,6 @@ def sort_by_image_position_patient(file_names_or_datasets, reverse=False):
 
 def get_referenced_sop_instance_uids(ds):
     """
-    Extracts referenced SOPClassUIDs along with their associated SOPInstanceUIDs
-    from RTSTRUCT, RTPLAN, and RTDOSE DICOM files, ensuring no duplicates.
-
     This method scans the DICOM dataset for references to other DICOM instances
     and returns a dictionary where keys are SOPClassUIDs and values are lists
      of unique associated SOPInstanceUIDs.
