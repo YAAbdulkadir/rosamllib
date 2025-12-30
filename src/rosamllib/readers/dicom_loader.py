@@ -1,11 +1,13 @@
 import os
 import time
+import json
 import pandas as pd
 import multiprocessing as mp
 from functools import partial, lru_cache
 from typing import Iterable, List, Optional, Set, Union, Any, Dict
 from collections import defaultdict
 from itertools import chain
+from pathlib import Path
 from pydicom import dcmread
 import pydicom
 from pydicom.tag import Tag
@@ -2227,6 +2229,104 @@ class DICOMLoader:
             return_graph=return_graph,
         )
 
+    def save(self, out: Union[str, Path], *, metadata_format: str = "parquet") -> Path:
+        """
+        Persist the loader state needed to restore later.
+
+        Writes:
+            - dataset.json (DatasetNode hierarchy)
+            - metadata.(parquet|csv) (metadata_df)
+            - state.json (small scalar config)
+        """
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # Dataset hierarchy
+        dataset_dict = self.dataset.to_dict()
+        (out / "dataset.json").write_text(json.dumps(dataset_dict, indent=2))
+
+        # Metadata
+        if self.metadata_df is not None:
+            if metadata_format.lower() == "parquet":
+                self.metadata_df.to_parquet(out / "metadata.parquet", index=False)
+            elif metadata_format.lower() == "csv":
+                self.metadata_df.to_csv(out / "metadata.csv", index=False)
+            else:
+                raise ValueError("metadata_format must be 'parquet' or 'csv'")
+
+        # Scalar state
+        state = {"path": self.path}
+        (out / "state.json").write_text(json.dumps(state, indent=2))
+
+        return out
+
+    @classmethod
+    def load_saved(
+        cls,
+        saved_dir: Union[str, Path],
+        *,
+        data_path: Optional[str] = None,
+        metadata_format: Optional[str] = None,
+        rebuild_associations: bool = True,
+    ) -> "DICOMLoader":
+        """
+        Restore a DICOMLoader saved with `save()`.
+
+        Parameters
+        ----------
+        saved_dir : directory created by `save()`
+        data_path : override the loader.path (useful if files moved)
+        metadata_format : force 'parquet' or 'csv'; if None, auto-detect
+        rebuild_associations : re-run cache building / association wiring
+        """
+        saved_dir = Path(saved_dir)
+
+        # read scalar state
+        state_path = saved_dir / "state.json"
+        state = {}
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+
+        # decide the path to use
+        path = data_path or state.get("path")
+        if not path:
+            raise ValueError("No data_path provided and state.json missing/empty.")
+
+        loader = cls(path)
+
+        # Dataset
+        dataset_dict = json.loads((saved_dir / "dataset.json").read_text())
+        loader.dataset = DatasetNode.from_dict(dataset_dict)
+
+        # Metadata
+        loader.metadata_df = _read_metadata(saved_dir, metadata_format=metadata_format)
+
+        # rebuid derived structures from dataset tree
+        loader.dicom_files = _rebuild_dicom_files_from_dataset(loader)
+
+        # rebuild caches / associations
+        if rebuild_associations:
+            loader._rebuild_fast_lookups()
+            loader.dataset.associate_dicoms()
+
+        return loader
+
+    def _rebuild_fast_lookups(self) -> None:
+        """
+        Rebuilds internal fast lookup(s) like `_sop_to_instance` from the dataset tree.
+        """
+        self._sop_to_instance = {}
+
+        # Example traversal that assumes:
+        # dataset -> patients -> studies -> series -> instances
+        for patient in self.dataset:
+            for study in patient:
+                for series in study:
+                    for instance in series:
+                        sop = getattr(instance, "SOPInstanceUID", None)
+                        if sop:
+                            self._sop_to_instance[sop] = instance
+
     def __iter__(self):
         """
         Iterates over all loaded patients in the dataset.
@@ -2287,3 +2387,49 @@ class DICOMLoader:
             f"dataset_id='{dataset_id}', "
             f"NumPatients={num_patients})"
         )
+
+
+def _read_metadata(saved_dir: Path, *, metadata_format: Optional[str]) -> Optional[pd.DataFrame]:
+    """
+    Load metadata df if present.
+    Prefers parquet if both exist unless metadata_format forces otherwise.
+    """
+    parquet_path = saved_dir / "metadata.parquet"
+    csv_path = saved_dir / "metadata.csv"
+
+    if metadata_format is None:
+        if parquet_path.exists():
+            return pd.read_parquet(parquet_path)
+        if csv_path.exists():
+            return pd.read_csv(csv_path)
+        return None
+
+    fmt = metadata_format.lower()
+    if fmt == "parquet":
+        return pd.read_parquet(parquet_path) if parquet_path.exists() else None
+    if fmt == "csv":
+        return pd.read_csv(csv_path) if csv_path.exists() else None
+
+    raise ValueError("metadata_format must be None, 'parquet', or 'csv'")
+
+
+def _rebuild_dicom_files_from_dataset(loader: DICOMLoader) -> dict:
+    """ """
+    dicom_files = {}
+    for patient in loader:  # relies on your __iter__ to iterate patients
+        pid = getattr(patient, "PatientID", None) or getattr(patient, "patient_id", None)
+        if pid is None:
+            # fall back to node id/name if needed
+            pid = getattr(patient, "id", None) or getattr(patient, "name", "UNKNOWN_PATIENT")
+
+        dicom_files.setdefault(pid, {})
+        for study in patient:
+            for series in study:
+                sid = getattr(series, "SeriesInstanceUID", None) or getattr(
+                    series, "series_uid", None
+                )
+                if sid is None:
+                    sid = getattr(series, "id", None) or getattr(series, "name", "UNKNOWN_SERIES")
+                dicom_files[pid][sid] = series
+
+    return dicom_files
