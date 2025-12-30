@@ -6,6 +6,7 @@ from pydicom.multival import MultiValue
 from rosamllib.constants import VR_TO_DTYPE
 from functools import wraps
 from pydicom.valuerep import DA, TM, DT
+from datetime import date as _Date, time as _Time, datetime as _DateTime
 
 
 def query_df(df: pd.DataFrame, **filters: Union[str, List[Any], Dict[str, Any]]) -> pd.DataFrame:
@@ -201,6 +202,107 @@ def _parse_str_like(value: Any):
     return str(value)
 
 
+def _da_to_date(v) -> _Date:
+    """
+    Convert a DICOM DA (or DA-like string) to datetime.date.
+    DIOCM DA is 'YYYYMMDD' (optionally shorter, but we assume full).
+    """
+    if not isinstance(v, DA):
+        v = DA(v)
+    s = str(v)
+    year = int(s[0:4])
+    month = int(s[4:6]) if len(s) >= 6 else 1
+    day = int(s[6:8]) if len(s) >= 8 else 1
+
+    return _Date(year, month, day)
+
+
+def _tm_to_time(v) -> _Time:
+    """
+    Convert a DICOM TM (or TM-like string) to datetime.time.
+
+    DICOM TM is 'HHMMSS.frac', or shorter (HHMM, HH).
+    We parse what we have and default missing fields to zero.
+    """
+    if not isinstance(v, TM):
+        v = TM(v)
+    s = str(v)
+
+    # Split off fractional seconds if present
+    if "." in s:
+        main, frac = s.split(".", 1)
+    else:
+        main, frac = s, ""
+
+    hh = int(main[0:2]) if len(main) >= 2 else 0
+    mm = int(main[2:4]) if len(main) >= 4 else 0
+    ss = int(main[4:6]) if len(main) >= 6 else 0
+
+    micro = 0
+    if frac:
+        # up to 6 digits of fractional seconds -> microseconds
+        frac = (frac + "000000")[:6]
+        micro = int(frac)
+
+    return _Time(hh, mm, ss, micro)
+
+
+def _dt_to_datetime(v) -> _DateTime:
+    """
+    Convert a DICOM DT (or DT-like string) to datetime.datetime.
+
+    We first try pydicom's DT(...) helper to get a Python datetime via .datetime;
+    if that fails, we fall back to a simple manual parse of 'YYYYMMDDHHMMSS.frac'.
+    """
+    if not isinstance(v, DT):
+        v = DT(v)
+
+    s = str(v)
+
+    # Basic date/time parts
+    year = int(s[0:4])
+    month = int(s[4:6]) if len(s) >= 6 else 1
+    day = int(s[6:8]) if len(s) >= 8 else 1
+
+    hh = int(s[8:10]) if len(s) >= 10 else 0
+    mm = int(s[10:12]) if len(s) >= 12 else 0
+    ss = int(s[12:14]) if len(s) >= 14 else 0
+
+    micro = 0
+    # fractional seconds and/or offsets may follow; we just handle fraction
+    rest = s[14:]
+    if rest.startswith("."):
+        frac = rest[1:]
+        # strip anything after a potential '+' or '-' timezone offset
+        for sep in ("+", "-"):
+            if sep in frac:
+                frac = frac.split(sep, 1)[0]
+                break
+        frac = (frac + "000000")[:6]
+        if frac.strip("0"):
+            micro = int(frac)
+
+    return _DateTime(year, month, day, hh, mm, ss, micro)
+
+
+def _parse_da_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [_da_to_date(v) for v in value]
+    return _da_to_date(value)
+
+
+def _parse_tm_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [_tm_to_time(v) for v in value]
+    return _tm_to_time(value)
+
+
+def _parse_dt_like(value: Any):
+    if isinstance(value, MultiValue):
+        return [_dt_to_datetime(v) for v in value]
+    return _dt_to_datetime(value)
+
+
 def parse_vr_value(vr: str, value: Any):
     """
     Parses DICOM tag values based on VR.
@@ -220,45 +322,43 @@ def parse_vr_value(vr: str, value: Any):
     """
     # Treat None / emtpy string as-is
     if value in (None, "", b""):
+        if vr == "PN":
+            return ""
+        if vr in ["DA", "DT", "TM"]:
+            return None
         return value
 
-    # Already-parsed pydicom VRs -> convert to Python's stdlib types
-    if isinstance(value, (DA, TM, DT)):
-        return value
+    vr = (vr or "").upper()
 
-    # Handle string / MultiValue cases explicitly by VR
     try:
+        # Date/Time types
         if vr == "DA":
-            # DICOM DA is always YYYYMMDD
-            if isinstance(value, MultiValue):
-                return [DA(v) for v in value]
-            return DA(value)
+            return _parse_da_like(value)
 
         elif vr == "TM":
-            if isinstance(value, MultiValue):
-                return [TM(v) for v in value]
-            return TM(value)
+            return _parse_tm_like(value)
 
         elif vr == "DT":
-            if isinstance(value, MultiValue):
-                return [DT(v) for v in value]
-            return DT(value)
+            return _parse_dt_like(value)
 
+        # Integer like
         elif vr in ["IS", "SL", "SS", "UL", "US"]:
             return _parse_int_like(value)
 
+        # Float like
         elif vr in ["DS", "FL", "FD"]:
             return _parse_float_like(value)
 
-        elif vr == "LO":
+        # String like
+        elif vr in {"LO", "SH", "ST", "LT", "CS", "UI", "AE", "AS", "UC", "UR", "UT", "PN"}:
             return _parse_str_like(value)
 
     except Exception:
         # If any of the parsing steps above fails, fall back to original value
         return None
 
-    # Default: return original value untouched
-    return value
+    # Fallbackl for VRs we haven't explicitly mapped: store as string
+    return _parse_str_like(value)
 
 
 def get_pandas_column_dtype(tag):
