@@ -6,25 +6,44 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from rosamllib.nodes import DatasetNode, PatientNode, SeriesNode, InstanceNode
+    from rosamllib.db.db_nodes import SeriesNodeDB, InstanceNodeDB
 
     NodeT = Union["SeriesNode", "InstanceNode"]
 
+    SeriesLike = Union[SeriesNode, SeriesNodeDB]
+    InstanceLike = Union[InstanceNode, InstanceNodeDB]
+    NodeLike = Union[SeriesLike, InstanceLike]
+
 
 def get_referenced_nodes(
-    node: Union[SeriesNode, InstanceNode],
+    node: NodeLike,
     modality: Optional[Union[str, Iterable[str]]] = None,
     level: str = "INSTANCE",
     recursive: bool = True,
     include_start: bool = False,
-) -> List[Union[SeriesNode, InstanceNode]]:
+) -> List[NodeLike]:
     """
-    Return referenced nodes of a specified level (INSTANCE|SERIES), optionally filtered
-    by modality.
-    - Direct neighbors are always considered; if `recursive=False`, stop after depth=1.
-    - If `recursive=True`, traverse further (no depth limit).
-    - `include_start=False` by default (doesn't include the input `node` in results).
+    Return nodes that are *referenced by* the given node.
+
+    Works for:
+        - SeriesNode / InstanceNode (in-memory)
+        - SeriesNodeDB / InstanceNodeDB (DB-backed)
+
+    Parameters
+    ----------
+    node : SeriesNode | InstanceNode | SeriesNodeDB | InstanceNodeDB
+    modality : str or Iterable[str], optional
+        Case-insensitive modality filter.
+    level : {'INSTANCE', 'SERIES'}
+        Whether to return instance- or series-level nodes.
+    recursive : bool, default True
+        If False, only direct neighbors are returned (depth=1).
+    include_start : bool, default False
+        Whether to include the starting node in the results (if it matches
+        the level and modality).
     """
     from rosamllib.nodes import SeriesNode, InstanceNode
+    from rosamllib.db.db_nodes import SeriesNodeDB, InstanceNodeDB
 
     def norm_modalities(m) -> Optional[Set[str]]:
         if m is None:
@@ -40,9 +59,13 @@ def get_referenced_nodes(
         return (mod or "").upper() in wanted
 
     def maybe_add(n):
-        if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
+        if (
+            level == "INSTANCE"
+            and isinstance(n, (InstanceNode, InstanceNodeDB))
+            and modality_ok(n)
+        ):
             out.append(n)
-        elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
+        elif level == "SERIES" and isinstance(n, (SeriesNode, SeriesNodeDB)) and modality_ok(n):
             out.append(n)
 
     level = level.upper()
@@ -50,7 +73,7 @@ def get_referenced_nodes(
         raise ValueError("level must be 'INSTANCE' or 'SERIES'")
 
     wanted = norm_modalities(modality)
-    out: List[Union[SeriesNode, InstanceNode]] = []
+    out: List[NodeLike] = []
     seen: Set[int] = set()
 
     # BFS
@@ -78,12 +101,19 @@ def get_referenced_nodes(
             continue
 
         # neighbors
-        if isinstance(n, SeriesNode):
+        if isinstance(n, (SeriesNode, SeriesNodeDB)):
             # 1) direct series->series links (e.g., REG/SEG edges resolved at series level)
             for s in getattr(n, "referenced_series", []) or []:
                 q.append((s, d + 1))
             # 2) go through instances to follow instance-level links
-            for inst in getattr(n, "instances", {}).values():
+            instances_attr = getattr(n, "instances", None)
+            if isinstance(instances_attr, dict):
+                inst_iter = instances_attr.values()
+            else:
+                iter_fn = getattr(n, "iter_instances", None)
+                inst_iter = iter_fn() if callable(iter_fn) else []
+
+            for inst in inst_iter:
                 # instance->instance
                 for ref in getattr(inst, "referenced_instances", []) or []:
                     q.append((ref, d + 1))
@@ -91,7 +121,7 @@ def get_referenced_nodes(
                 for s in getattr(inst, "referenced_series", []) or []:
                     q.append((s, d + 1))
 
-        elif isinstance(n, InstanceNode):
+        elif isinstance(n, (InstanceNode, InstanceNodeDB)):
             # instance->instance
             for ref in getattr(n, "referenced_instances", []) or []:
                 q.append((ref, d + 1))
@@ -100,8 +130,8 @@ def get_referenced_nodes(
                 q.append((s, d + 1))
 
     # de-dup while preserving order (by id)
-    seen_ids = set()
-    deduped = []
+    seen_ids: Set[int] = set()
+    deduped: List[NodeLike] = []
     for x in out:
         xid = id(x)
         if xid not in seen_ids:
@@ -112,7 +142,7 @@ def get_referenced_nodes(
 
 
 def get_referencing_nodes(
-    node: Union[SeriesNode, InstanceNode],
+    node: NodeLike,
     modality: Optional[Union[str, Iterable[str]]] = None,
     level: str = "INSTANCE",
     recursive: bool = True,
@@ -123,7 +153,7 @@ def get_referencing_nodes(
 
     Parameters
     ----------
-    node : SeriesNode | InstanceNode
+    node : SeriesNode | InstanceNode | SeriesNodeDB | InstanceNodeDB
         Anchor node. If an InstanceNode is provided, its parent SeriesNode is used.
     level : {'SERIES', 'INSTANCE'}, default 'SERIES'
         - 'SERIES': return SeriesNode peers in the same Frame of Reference (FoR).
@@ -142,7 +172,7 @@ def get_referencing_nodes(
 
     Returns
     -------
-    list[SeriesNode] | list[InstanceNode]
+    list[NodeLike]
         Peers in the same Frame of Reference, filtered by level/modality.
 
     Notes
@@ -167,6 +197,7 @@ def get_referencing_nodes(
     """
 
     from rosamllib.nodes import SeriesNode, InstanceNode
+    from rosamllib.db.db_nodes import SeriesNodeDB, InstanceNodeDB
 
     def norm_modalities(m) -> Optional[Set[str]]:
         if m is None:
@@ -182,9 +213,13 @@ def get_referencing_nodes(
         return (mod or "").upper() in wanted
 
     def maybe_add(n):
-        if level == "INSTANCE" and isinstance(n, InstanceNode) and modality_ok(n):
+        if (
+            level == "INSTANCE"
+            and isinstance(n, (InstanceNode, InstanceNodeDB))
+            and modality_ok(n)
+        ):
             out.append(n)
-        elif level == "SERIES" and isinstance(n, SeriesNode) and modality_ok(n):
+        elif level == "SERIES" and isinstance(n, (SeriesNode, SeriesNodeDB)) and modality_ok(n):
             out.append(n)
 
     def enqueue(nei, depth):
@@ -197,10 +232,11 @@ def get_referencing_nodes(
         raise ValueError("level must be 'INSTANCE' or 'SERIES'")
 
     wanted = norm_modalities(modality)
-    out: List[Union[SeriesNode, InstanceNode]] = []
+    out: List[NodeLike] = []
     seen: Set[int] = set()
     q = deque()
     q.append((node, 0))
+
     if include_start:
         maybe_add(node)
 
@@ -222,7 +258,7 @@ def get_referencing_nodes(
             continue
 
         # ---- incoming neighbors ----
-        if isinstance(n, InstanceNode):
+        if isinstance(n, (InstanceNode, InstanceNodeDB)):
             # instances that reference this instance
             for rin in getattr(n, "referencing_instances", []) or []:
                 enqueue(rin, d + 1)
@@ -240,7 +276,7 @@ def get_referencing_nodes(
                 for rs in getattr(ps, "referencing_series", []) or []:
                     enqueue(rs, d + 1)
 
-        elif isinstance(n, SeriesNode):
+        elif isinstance(n, (SeriesNode, SeriesNodeDB)):
             # series that reference this series (if populated)
             for rs in getattr(n, "referencing_series", []) or []:
                 enqueue(rs, d + 1)
@@ -252,8 +288,8 @@ def get_referencing_nodes(
                     enqueue(getattr(rin, "parent_series", None), d + 1)
 
     # stable de-dup by object id
-    uniq_ids = set()
-    deduped = []
+    uniq_ids: Set[int] = set()
+    deduped: List[NodeLike] = []
     for x in out:
         xid = id(x)
         if xid not in uniq_ids:
@@ -264,14 +300,14 @@ def get_referencing_nodes(
 
 
 def get_frame_registered_nodes(
-    node: Union[SeriesNode, InstanceNode],
+    node: NodeLike,
     *,
     level: str = "SERIES",
     include_self: bool = False,
     modality: Optional[Union[str, Iterable[str]]] = None,
     dicom_files: Optional[Dict[str, Dict[str, SeriesNode]]] = None,
     derive_frame_from_references: bool = True,
-) -> List[Union[SeriesNode, InstanceNode]]:
+) -> List[NodeLike]:
     """
     Return nodes that share at least one effective FrameOfReferenceUID with the anchor.
 
@@ -293,7 +329,7 @@ def get_frame_registered_nodes(
     def _inst_mod_ok(i):
         return wanted is None or (getattr(i, "Modality", None) or "").upper() in wanted
 
-    def _effective_fors(series: SeriesNode) -> set[str]:
+    def _effective_fors(series: SeriesLike) -> set[str]:
         fors: set[str] = set()
         fo_direct = getattr(series, "FrameOfReferenceUID", None)
         if fo_direct:
@@ -316,9 +352,15 @@ def get_frame_registered_nodes(
     wanted = _wanted_set(modality)
 
     # Anchor series + anchor FoR set
-    anchor_series = node if isinstance(node, SeriesNode) else getattr(node, "parent_series", None)
+    anchor_series = (
+        node
+        if isinstance(node, (SeriesNode, SeriesNodeDB))
+        else getattr(node, "parent_series", None)
+    )
     anchor_fors: set[str] = set()
-    if isinstance(node, InstanceNode) and getattr(node, "FrameOfReferenceUIDs", None):
+    if isinstance(node, (InstanceNode, InstanceNodeDB)) and getattr(
+        node, "FrameOfReferenceUIDs", None
+    ):
         anchor_fors |= {str(u) for u in (node.FrameOfReferenceUIDs or []) if u}
     if anchor_series and getattr(anchor_series, "FrameOfReferenceUID", None):
         anchor_fors.add(str(anchor_series.FrameOfReferenceUID))
@@ -329,14 +371,22 @@ def get_frame_registered_nodes(
     if not anchor_fors:
         # no FoR context — return only self if requested
         if include_self:
-            if lvl == "SERIES" and isinstance(node, SeriesNode) and _series_mod_ok(node):
+            if (
+                lvl == "SERIES"
+                and isinstance(node, (SeriesNode, SeriesNodeDB))
+                and _series_mod_ok(node)
+            ):
                 return [node]
-            if lvl == "INSTANCE" and isinstance(node, InstanceNode) and _inst_mod_ok(node):
+            if (
+                lvl == "INSTANCE"
+                and isinstance(node, (InstanceNode, InstanceNodeDB))
+                and _inst_mod_ok(node)
+            ):
                 return [node]
         return []
 
     # Collect peer series: intersection of effective FoRs with anchor_fors
-    peer_series: list[SeriesNode] = []
+    peer_series: list[SeriesLike] = []
     seen_sid: set[int] = set()
 
     # Prefer dicom_files when provided (covers RTSTRUCT/SEG/REG cases correctly)
@@ -376,9 +426,9 @@ def get_frame_registered_nodes(
         return dedup
 
     # INSTANCE level: return instances from anchor (optional) + peer series
-    out_i: list[InstanceNode] = []
+    out_i: list[InstanceLike] = []
 
-    def add_series(series: SeriesNode):
+    def add_series(series: SeriesLike):
         for inst in getattr(series, "instances", {}).values():
             if _inst_mod_ok(inst):
                 out_i.append(inst)
