@@ -686,8 +686,8 @@ class PatientNode(_ExtensibleAttrs):
                 study_uid=study_uid, study_description=study_description, parent_patient=self
             )
             self.studies[study_uid] = s
-        if not s.StudyDescription and study_description:
-            s.StudyDescription = study_description
+        if not s.study_description and study_description:
+            s.study_description = study_description
         return s
 
     # --- access / dunder ---
@@ -1413,6 +1413,17 @@ class PatientNode(_ExtensibleAttrs):
     def __iter__(self) -> Iterator[StudyNode]:
         return iter(self.studies.values())
 
+    def iter_studies(self) -> Iterator[StudyNode]:
+        return self.__iter__()
+
+    def iter_series(self) -> Iterator[SeriesNode]:
+        for study in self.iter_studies():
+            yield from study
+
+    def iter_instances(self) -> Iterator[InstanceNode]:
+        for series in self.iter_series():
+            yield from series
+
     def __getattr__(self, name: str) -> Any:
         # 1) try extras (from mixin)
         try:
@@ -1610,6 +1621,13 @@ class StudyNode(_ExtensibleAttrs):
     def __iter__(self) -> Iterator[SeriesNode]:
         return iter(self.series.values())
 
+    def iter_series(self) -> Iterator[SeriesNode]:
+        return self.__iter__()
+
+    def iter_instances(self) -> Iterator[InstanceNode]:
+        for series in self.iter_series():
+            yield from series
+
     def __getattr__(self, name: str) -> Any:
         # 1) extras
         try:
@@ -1778,6 +1796,7 @@ class SeriesNode(_ExtensibleAttrs):
                 self.instance_paths.append(file_path)
 
     # --- access / dunder ---
+
     def get_instance(self, sop_instance_uid: str) -> Optional[InstanceNode]:
         return self.instances.get(sop_instance_uid)
 
@@ -1792,6 +1811,9 @@ class SeriesNode(_ExtensibleAttrs):
 
     def __iter__(self) -> Iterator[InstanceNode]:
         return iter(self.instances.values())
+
+    def iter_instances(self) -> Iterator[InstanceNode]:
+        return self.__iter__()
 
     def __getattr__(self, name: str) -> Any:
         # 1) extras
