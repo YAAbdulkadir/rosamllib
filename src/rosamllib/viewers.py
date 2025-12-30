@@ -1143,7 +1143,7 @@ def visualize_series_references(
 
     def get_referenced_series(series):
         referenced_series = list()
-        for sop_uid, instance in series.instances.items():
+        for instance in series.iter_instances():
             if instance.referenced_sids:
                 for ref_sid in instance.referenced_sids:
                     parent_dataset = (
@@ -1157,7 +1157,7 @@ def visualize_series_references(
 
     def get_other_referenced_series(series):
         referenced_series = list()
-        for sop_uid, instance in series.instances.items():
+        for instance in series.iter_instances():
             if instance.other_referenced_sids:
                 for ref_sid in instance.other_referenced_sids:
                     parent_dataset = (
@@ -1484,8 +1484,8 @@ def visualize_series_references(
                                 referenced_series_uid = referenced_series.SeriesInstanceUID
                                 referencing_nodes_set.add(series.SeriesInstanceUID)
 
-                                # Draw an edge pointing *upwards* from the referenced series
-                                # to the referencing series
+                                # Draw an edge pointing *upwards* from the referencing series
+                                # to the referenced series
                                 graph.edge(
                                     series.SeriesInstanceUID,
                                     referenced_series_uid,
@@ -1501,7 +1501,7 @@ def visualize_series_references(
                                         referencing_nodes_set.add(ref_inst.SOPInstanceUID)
 
                                         # Draw an edge pointing *upwards* from the
-                                        # referenced node to the referencing node
+                                        # referencing node to the referenced node
                                         graph.edge(
                                             series.SeriesInstanceUID,
                                             ref_inst.SOPInstanceUID,
