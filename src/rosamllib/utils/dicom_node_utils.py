@@ -962,7 +962,7 @@ def associate_dicoms(
     from rosamllib.nodes import DatasetNode, PatientNode, SeriesNode
 
     # Normalization: make dicom_files -> Dict[pid -> Dict[sid -> SeriesNode]]
-    def _collect_series_by_patient(src) -> Dict[str, Dict[str, "SeriesNode"]]:
+    def _collect_series_by_patient(src) -> Dict[str, Dict[str, SeriesNode]]:
         # Back-compat: already in the expected dict shape
         if isinstance(src, dict):
             return src
