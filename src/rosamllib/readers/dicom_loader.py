@@ -627,6 +627,7 @@ class DICOMLoader:
                     series_desc = inst_dict.get("SeriesDescription")
                     modality = (inst_dict.get("Modality") or "").upper()
                     filepath = inst_dict.get("FilePath")
+                    is_embedded_in_raw = inst_dict.get("is_embedded_in_raw", False)
 
                     if patient_id is None or series_uid is None:
                         continue
@@ -643,6 +644,11 @@ class DICOMLoader:
                         series.FrameOfReferenceUID = inst_dict.get("FrameOfReferenceUID")
                         self.dicom_files[patient_id][series_uid] = series
                     series = self.dicom_files[patient_id][series_uid]
+                    series.is_embedded_in_raw = is_embedded_in_raw
+                    if series.is_embedded_in_raw:
+                        series.raw_series_reference_uid = inst_dict.get(
+                            "raw_series_reference_uid", None
+                        )
                     instance_node = series.get_instance(sop_instance_uid)
                     if not instance_node:
                         instance_node = InstanceNode(
