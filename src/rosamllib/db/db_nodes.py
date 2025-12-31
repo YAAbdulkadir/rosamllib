@@ -814,9 +814,110 @@ class DatasetNodeDB(_DBNodeBase, JSONListFieldMixin):
                 rebuild=rebuild,
             )
 
+    def n_patients(self) -> int:
+        with self._session() as s:
+            return int(
+                s.scalar(
+                    select(func.count())
+                    .select_from(PatientRow)
+                    .where(PatientRow.dataset_id == self.dataset_id)
+                )
+                or 0
+            )
+
+    def n_studies(self, *, PatientID: Optional[str] = None) -> int:
+        with self._session() as s:
+            stmt = (
+                select(func.count())
+                .select_from(StudyRow)
+                .where(StudyRow.dataset_id == self.dataset_id)
+            )
+
+            if PatientID is not None:
+                stmt = stmt.where(StudyRow.PatientID == PatientID)
+
+            return int(s.scalar(stmt) or 0)
+
+    def n_series(
+        self,
+        *,
+        PatientID: Optional[str] = None,
+        StudyInstanceUID: Optional[str] = None,
+    ) -> int:
+        with self._session() as s:
+            stmt = (
+                select(func.count())
+                .select_from(SeriesRow)
+                .where(SeriesRow.dataset_id == self.dataset_id)
+            )
+
+            if StudyInstanceUID is not None:
+                stmt = stmt.where(SeriesRow.StudyInstanceUID == StudyInstanceUID)
+
+            if PatientID is not None:
+                stmt = stmt.join(
+                    StudyRow,
+                    (StudyRow.dataset_id == SeriesRow.dataset_id)
+                    & (StudyRow.StudyInstanceUID == SeriesRow.StudyInstanceUID),
+                ).where(StudyRow.PatientID == PatientID)
+
+        return int(s.scalar(stmt) or 0)
+
+    def n_instances(
+        self,
+        *,
+        PatientID: Optional[str] = None,
+        StudyInstanceUID: Optional[str] = None,
+        SeriesInstanceUID: Optional[str] = None,
+        Modality: Optional[str] = None,
+    ) -> int:
+        with self._session() as s:
+            stmt = (
+                select(func.count())
+                .select_from(InstanceRow)
+                .where(InstanceRow.dataset_id == self.dataset_id)
+            )
+
+            if SeriesInstanceUID is not None:
+                stmt = stmt.where(InstanceRow.SeriesInstanceUID == SeriesInstanceUID)
+
+            if Modality is not None:
+                stmt = stmt.where(InstanceRow.Modality == Modality)
+
+            if StudyInstanceUID is not None or PatientID is not None:
+                stmt = stmt.join(
+                    SeriesRow,
+                    (SeriesRow.dataset_id == InstanceRow.dataset_id)
+                    & (SeriesRow.SeriesInstanceUID == InstanceRow.SeriesInstanceUID),
+                )
+
+            if StudyInstanceUID is not None:
+                stmt = stmt.where(SeriesRow.StudyInstanceUID == StudyInstanceUID)
+
+            if PatientID is not None:
+                stmt = stmt.join(
+                    StudyRow,
+                    (StudyRow.dataset_id == SeriesRow.dataset_id)
+                    & (StudyRow.StudyInstanceUID == SeriesRow.StudyInstanceUID),
+                ).where(StudyRow.PatientID == PatientID)
+
+        return int(s.scalar(stmt) or 0)
+
     def __iter__(self):
         """Iterate over PatientNodeDB objects in this dataset."""
         return self.iter_patients()
+
+    def __len__(self) -> int:
+        """
+        Number of patients in this dataset.
+        """
+        with self._session() as s:
+            n = s.scalar(
+                select(func.count())
+                .select_from(PatientRow)
+                .where(PatientRow.dataset_id == self.dataset_id)
+            )
+        return int(n or 0)
 
 
 # PatientNodeDB
