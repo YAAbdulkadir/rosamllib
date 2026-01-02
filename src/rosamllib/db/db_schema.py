@@ -21,6 +21,7 @@ from sqlalchemy import (
     select,
     ForeignKey,
     Index,
+    inspect,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -381,11 +382,36 @@ def init_schema(
 
     Base.metadata.create_all(engine)
 
+    if not tag_plan:
+        _reflect_and_map_instance_dynamic_columns(engine)
+
     with Session(engine) as session:
         existing = session.get(MetaRow, "schema_version")
         if existing is None:
             session.add(MetaRow(key="schema_version", value="1"))
             session.commit()
+
+
+def _reflect_and_map_instance_dynamic_columns(engine) -> None:
+    """
+    Ensure InstanceRow has mapped properties for *existing DB columns*
+    that aren't part of the base schema.
+    """
+    insp = inspect(engine)
+    db_cols = insp.get_columns("instances")
+    existing_names = {col.name for col in InstanceRow.__table__.columns}
+
+    for c in db_cols:
+        name = c["name"]
+        if name in existing_names:
+            continue
+
+        coltype = c["type"]
+        col = Column(name, coltype)
+
+        InstanceRow.__table__.append_column(col)
+        InstanceRow.__mapper__.add_property(name, col)
+        existing_names.add(name)
 
 
 # Save: DatasetNode -> DB
@@ -824,23 +850,127 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
     series_by_uid: Dict[str, SeriesNode] = {}
     instances_by_uid: Dict[str, InstanceNode] = {}
 
+    def _ensure_patient(pid: str) -> PatientNode:
+        pnode = patients_by_id.get(pid)
+        if pnode is not None:
+            return pnode
+
+        row = session.execute(
+            select(PatientRow.PatientID, PatientRow.PatientName, PatientRow.extras_json).where(
+                PatientRow.dataset_id == dataset_id,
+                PatientRow.PatientID == pid,
+            )
+        ).one_or_none()
+
+        if row is None:
+            # If DB is inconsistent, still create a placeholder patient node.
+            p = PatientNode(patient_id=pid, patient_name=None, parent_dataset=ds)
+            ds.add_patient(p)
+            patients_by_id[pid] = p
+            return p
+
+        pid2, pname2, pextras2 = row
+        p = PatientNode(patient_id=pid2, patient_name=pname2, parent_dataset=ds)
+        for k, v in (pextras2 or {}).items():
+            p.set_attrs(**{k: v})
+        ds.add_patient(p)
+        patients_by_id[pid2] = p
+        return p
+
+    def _ensure_study(study_uid: str) -> StudyNode:
+        st = studies_by_uid.get(study_uid)
+        if st is not None:
+            return st
+
+        row = session.execute(
+            select(
+                StudyRow.PatientID,
+                StudyRow.StudyInstanceUID,
+                StudyRow.StudyDescription,
+                StudyRow.extras_json,
+            ).where(
+                StudyRow.dataset_id == dataset_id,
+                StudyRow.StudyInstanceUID == study_uid,
+            )
+        ).one_or_none()
+
+        if row is None:
+            raise RuntimeError(
+                f"StudyInstanceUID={study_uid!r} referenced but "
+                f"missing in DB (dataset_id={dataset_id!r})."
+            )
+
+        st_pid, st_uid, st_desc, st_extras = row
+        parent_patient = _ensure_patient(st_pid)
+
+        st = StudyNode(
+            study_uid=st_uid,
+            study_description=st_desc,
+            parent_patient=parent_patient,
+        )
+        for k, v in (st_extras or {}).items():
+            st.set_attrs(**{k: v})
+        parent_patient.add_study(st)
+        studies_by_uid[st_uid] = st
+        return st
+
+    def _ensure_series(series_uid: str) -> SeriesNode:
+        se = series_by_uid.get(series_uid)
+        if se is not None:
+            return se
+
+        srow = session.scalar(
+            select(SeriesRow).where(
+                SeriesRow.dataset_id == dataset_id,
+                SeriesRow.SeriesInstanceUID == series_uid,
+            )
+        )
+        if srow is None:
+            raise RuntimeError(
+                f"SeriesInstanceUID={series_uid!r} referenced but "
+                f"missing in DB (dataset_id={dataset_id!r})."
+            )
+
+        parent_study = studies_by_uid.get(srow.StudyInstanceUID)
+        if parent_study is None:
+            parent_study = _ensure_study(srow.StudyInstanceUID)
+
+        se = SeriesNode(series_uid=srow.SeriesInstanceUID, parent_study=parent_study)
+        se.Modality = srow.Modality
+        se.SeriesDescription = srow.SeriesDescription
+        se.FrameOfReferenceUID = srow.FrameOfReferenceUID
+        se.is_embedded_in_raw = bool(srow.is_embedded_in_raw)
+        se.raw_series_reference_uid = srow.raw_series_ref_uid
+
+        se.instance_paths = list(srow.instance_paths_json or [])
+        se.referenced_sids = list(srow.referenced_sids_json or [])
+        se.referencing_sids = list(srow.referencing_sids_json or [])
+
+        for k, v in (srow.extras_json or {}).items():
+            se.set_attrs(**{k: v})
+
+        parent_study.add_series(se)
+        series_by_uid[srow.SeriesInstanceUID] = se
+        return se
+
     # -------------------------
     # 2a) Patient (single)
     # -------------------------
-    # Load only needed columns (avoid full ORM row)
-    pid, pname, pextras = session.execute(
-        select(PatientRow.PatientID, PatientRow.PatientName, PatientRow.extras_json).where(
-            PatientRow.dataset_id == dataset_id,
-            PatientRow.PatientID == patient_id,
-        )
-    ).one()
+    # # Load only needed columns (avoid full ORM row)
+    # pid, pname, pextras = session.execute(
+    #     select(PatientRow.PatientID, PatientRow.PatientName, PatientRow.extras_json).where(
+    #         PatientRow.dataset_id == dataset_id,
+    #         PatientRow.PatientID == patient_id,
+    #     )
+    # ).one()
+    p = _ensure_patient(patient_id)
     timers.mark("2a) load patient (cols)")
 
-    p = PatientNode(patient_id=pid, patient_name=pname, parent_dataset=ds)
-    for k, v in (pextras or {}).items():
-        p.set_attrs(**{k: v})
-    ds.add_patient(p)
-    patients_by_id[pid] = p
+    # p = PatientNode(patient_id=pid, patient_name=pname, parent_dataset=ds)
+    # for k, v in (pextras or {}).items():
+    #     p.set_attrs(**{k: v})
+    # ds.add_patient(p)
+    # patients_by_id[pid] = p
     timers.mark("2b) build PatientNode")
 
     # -------------------------
@@ -864,9 +994,14 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
     timers.mark("2c) load studies (cols)")
 
     for st_pid, st_uid, st_desc, st_extras in study_rows:
-        if st_pid != patient_id:
-            # patient-local semantics: do not materialize other patients
+        # materialize under the actual patient of the study
+        parent_patient = _ensure_patient(st_pid)
+        if st_uid in studies_by_uid:
             continue
+
+        # if st_pid != patient_id:
+        #     # patient-local semantics: do not materialize other patients
+        #     continue
 
         st = StudyNode(
             study_uid=st_uid,
@@ -875,7 +1010,7 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
         )
         for k, v in (st_extras or {}).items():
             st.set_attrs(**{k: v})
-        p.add_study(st)
+        parent_patient.add_study(st)
         studies_by_uid[st_uid] = st
     timers.mark("2d) build StudyNodes")
 
@@ -897,11 +1032,17 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
 
     for srow in series_rows:
         parent_study = studies_by_uid.get(srow.StudyInstanceUID)
+        # if parent_study is None:
+        #     raise RuntimeError(
+        #         f"SeriesRow(SeriesInstanceUID={srow.SeriesInstanceUID!r}) refers to "
+        #         f"missing StudyInstanceUID={srow.StudyInstanceUID!r} (patient-local load)"
+        #     )
+
         if parent_study is None:
-            raise RuntimeError(
-                f"SeriesRow(SeriesInstanceUID={srow.SeriesInstanceUID!r}) refers to "
-                f"missing StudyInstanceUID={srow.StudyInstanceUID!r} (patient-local load)"
-            )
+            parent_study = _ensure_study(srow.StudyInstanceUID)
+
+        if srow.SeriesInstanceUID in series_by_uid:
+            continue
 
         se = SeriesNode(series_uid=srow.SeriesInstanceUID, parent_study=parent_study)
         se.Modality = srow.Modality
@@ -962,11 +1103,17 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
         extras_json,
     ) in instance_rows:
         parent_series = series_by_uid.get(series_uid)
+        # if parent_series is None:
+        #     raise RuntimeError(
+        #         f"InstanceRow(SOPInstanceUID={sop!r}) refers to "
+        #         f"missing SeriesInstanceUID={series_uid!r} (patient-local load)"
+        #     )
+
         if parent_series is None:
-            raise RuntimeError(
-                f"InstanceRow(SOPInstanceUID={sop!r}) refers to "
-                f"missing SeriesInstanceUID={series_uid!r} (patient-local load)"
-            )
+            parent_series = _ensure_series(series_uid)
+
+        if sop in instances_by_uid:
+            continue
 
         inst = InstanceNode(
             SOPInstanceUID=sop,
@@ -1002,5 +1149,5 @@ def load_patient(session: Session, dataset_id: str, patient_id: str) -> PatientN
             f"PatientID={patient_id!r} was not materialized (dataset_id={dataset_id!r})."
         )
 
-    timers.report(header=f"load_patient(patient-local, dataset={dataset_id}, patient=...)")
+    # timers.report(header=f"load_patient(patient-local, dataset={dataset_id}, patient=...)")
     return out
