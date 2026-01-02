@@ -1438,42 +1438,38 @@ class DICOMLoader:
 
         return None
 
-    def get_modality_distribution(self):
+    def get_modality_distribution(
+        self, *, all_instance_level, force_instance_level_modalities, unknown_label
+    ):
         """
-        Returns the distribution of modalities in the dataset, with special handling for certain
-        modalities.
+        Compute modality distribution across the dataset.
 
-        This method iterates over all `SeriesNode` objects in the dataset and calculates the
-        distribution of modalities. For modalities like `RTPLAN`, `RTDOSE`, `RTSTRUCT`, and
-        `RTRECORD`, the counts are based on the number of `InstanceNode` objects within those
-        series. For other modalities, the count is based on the number of `SeriesNode` objects.
+        Counting rules
+        --------------
+        - By default, each Series contributes +1 to its modality.
+        - If `all_instance_level=True`, every Instance contributes +1.
+        - If a modality is listed in `force_instance_level_modalities`,
+        it is counted at the Instance level regardless of the global setting.
+
+        Parameters
+        ----------
+        all_instance_level : bool, optional
+            If True, count all modalities at the instance level.
+        force_instance_level_modalities : Iterable[str], optional
+            Modalities that should always be counted at the instance level.
+        unknown_label : str, optional
+            Label used when Series.Modality is missing or empty.
 
         Returns
         -------
-        dict
-            A dictionary where keys are modalities and values are counts. For `RTPLAN`, `RTDOSE`,
-            `RTSTRUCT`, and `RTRECORD`, the values represent the total number of instances.
-            For all other modalities, the values represent the number of series.
-
-        Examples
-        --------
-        >>> distribution = loader.get_modality_distribution()
-        >>> print(distribution)
-        {'CT': 10, 'MR': 5, 'RTPLAN': 3, 'RTSTRUCT': 8, 'RTDOSE': 5, 'Unknown': 2}
+        dict[str, int]
+            Mapping from modality name to count.
         """
-        modality_counts = {}
-
-        for patient_node in self.dataset:
-            for study_node in patient_node:
-                for series_node in study_node:
-                    modality = series_node.Modality or "Unknown"
-                    if modality in ["RTPLAN", "RTDOSE", "RTSTRUCT", "RTRECORD"]:
-                        for instance_node in series_node:
-                            modality_counts[modality] = modality_counts.get(modality, 0) + 1
-                    else:
-                        modality_counts[modality] = modality_counts.get(modality, 0) + 1
-
-        return modality_counts
+        return self.dataset.get_modality_distribution(
+            all_instance_level=all_instance_level,
+            force_instance_level_modalities=force_instance_level_modalities,
+            unknown_label=unknown_label,
+        )
 
     def get_patient_ids(self):
         """
