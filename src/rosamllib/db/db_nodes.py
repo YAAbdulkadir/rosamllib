@@ -456,7 +456,6 @@ class DatasetNodeDB(_DBNodeBase, JSONListFieldMixin):
             seq_policy=seq_policy,
         )
 
-    @property
     def get_or_create_patient(
         self,
         PatientID: str,
@@ -843,7 +842,12 @@ class DatasetNodeDB(_DBNodeBase, JSONListFieldMixin):
         *,
         PatientID: Optional[str] = None,
         StudyInstanceUID: Optional[str] = None,
+        Modality: Optional[str] = None,
+        unknown_label: str = "Unknown",
     ) -> int:
+        # Normalize modality column
+        series_mod = func.coalesce(func.nullif(SeriesRow.Modality, ""), unknown_label)
+
         with self._session() as s:
             stmt = (
                 select(func.count())
@@ -854,6 +858,9 @@ class DatasetNodeDB(_DBNodeBase, JSONListFieldMixin):
             if StudyInstanceUID is not None:
                 stmt = stmt.where(SeriesRow.StudyInstanceUID == StudyInstanceUID)
 
+            if Modality is not None:
+                stmt = stmt.where(series_mod == str(Modality))
+
             if PatientID is not None:
                 stmt = stmt.join(
                     StudyRow,
@@ -861,7 +868,7 @@ class DatasetNodeDB(_DBNodeBase, JSONListFieldMixin):
                     & (StudyRow.StudyInstanceUID == SeriesRow.StudyInstanceUID),
                 ).where(StudyRow.PatientID == PatientID)
 
-        return int(s.scalar(stmt) or 0)
+            return int(s.scalar(stmt) or 0)
 
     def n_instances(
         self,
