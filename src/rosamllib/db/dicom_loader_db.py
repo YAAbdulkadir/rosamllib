@@ -4,12 +4,13 @@ import os
 import queue
 import logging
 import threading
+import pandas as pd
 from pathlib import Path
-from typing import Iterable, Optional, Union, Dict, Any
+from typing import Iterable, List, Optional, Union, Dict, Any
 
 import pydicom
 from tqdm import tqdm
-from rosamllib.db.db_nodes import DatasetNodeDB, DatasetRow
+from rosamllib.db.db_nodes import DatasetNodeDB
 from rosamllib.utils.db_utils import (
     CORE_TAGS,
     _normalize_tag,
@@ -19,10 +20,19 @@ from rosamllib.utils.db_utils import (
     ParseJob,
     setup_module_logging,
 )
-from rosamllib.db.db_schema import init_schema
+from rosamllib.db.db_schema import (
+    init_schema,
+    DatasetRow,
+    PatientRow,
+    StudyRow,
+    SeriesRow,
+    InstanceRow,
+)
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select, and_, func
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import Select
+
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +259,302 @@ class DICOMLoaderDB:
 
         self.dataset = dataset_db
 
+    def query(
+        self,
+        query_level: str = "INSTANCE",
+        *,
+        include: Optional[Iterable[str]] = None,
+        case_insensitive: bool = False,
+        sort_by: Optional[Iterable[str]] = None,
+        limit: Optional[int] = None,
+        **filters,
+    ) -> "pd.DataFrame":
+        """
+        Fast SQLite-first query using the instances table as the base.
+
+        Design (SQLite):
+        - Always filter from InstanceRow (fact table).
+        - PATIENT/STUDY/SERIES use SQL DISTINCT on ID columns (no pandas dedup).
+        - include columns can come from:
+            * InstanceRow (INSTANCE level only, plus ID cols at higher levels)
+            * PatientRow (e.g., PatientName)
+            * StudyRow   (e.g., StudyDescription)  [only when StudyInstanceUID is in level]
+            * SeriesRow  (e.g., SeriesDescription) [only when SeriesInstanceUID is in level]
+        - For SERIES-level include of "Modality", we prefer SeriesRow.Modality.
+        - Regex filtering is NOT supported for SQLite fast path.
+        - Wildcards: "*" -> SQL LIKE "%", excludes NULLs by default.
+        - None filter value means IS NULL.
+
+        Parameters
+        ----------
+        query_level : {'PATIENT','STUDY','SERIES','INSTANCE'}
+        include : optional iterable[str]
+            Extra columns to include in output.
+            Higher-level table columns are joined after DISTINCT IDs.
+        case_insensitive : bool
+            For string equality and LIKE.
+        sort_by : optional iterable[str]
+            Sort keys (only those in the final selected columns are applied).
+        limit : optional int
+            LIMIT in SQL.
+        **filters
+            Column filters applied on InstanceRow columns only (including dynamic tag columns).
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+
+        if self.dataset is None:
+            raise RuntimeError("Call load(config_or_path) first.")
+        ds = self.dataset
+
+        LEVEL_COLS = {
+            "PATIENT": ["PatientID"],
+            "STUDY": ["PatientID", "StudyInstanceUID"],
+            "SERIES": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID"],
+            "INSTANCE": ["PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"],
+        }
+
+        lvl = str(query_level).upper()
+        if lvl not in LEVEL_COLS:
+            raise ValueError(
+                f"Invalid query_level '{query_level}'. Must be one of {list(LEVEL_COLS)}."
+            )
+
+        include = list(include or [])
+        level_cols = LEVEL_COLS[lvl]
+
+        # -------------------------
+        # Helpers for filters
+        # -------------------------
+        inst_cols = InstanceRow.__table__.columns
+
+        def _inst_col(name: str):
+            if name not in inst_cols:
+                raise KeyError(
+                    f"Filter column {name!r} is not a column on InstanceRow. "
+                    "SQLite-fast query() v1 supports filtering on instance columns only."
+                )
+            return inst_cols[name]
+
+        def _like_pattern(s: str) -> str:
+            # Escape LIKE metacharacters and convert '*' to '%'
+            return (
+                s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("*", "%")
+            )
+
+        def _cmp(expr, value):
+            if value is None:
+                return expr.is_(None)
+
+            if isinstance(value, str) and "*" in value:
+                pat = _like_pattern(value)
+                if case_insensitive:
+                    return func.lower(expr).like(func.lower(pat), escape="\\")
+                return expr.like(pat, escape="\\")
+
+            if case_insensitive and isinstance(value, str):
+                return func.lower(expr) == value.lower()
+
+            return expr == value
+
+        def _compile_filter(expr, value):
+            """
+            Supports:
+            - scalar
+            - iterable -> IN
+            - dict ops: in, notin, gt,gte,lt,lte, exists
+            """
+            if isinstance(value, dict):
+                clauses = []
+
+                if "RegEx" in value or "regex" in value:
+                    raise NotImplementedError(
+                        "RegEx filtering not supported for SQLite-fast query()."
+                    )
+
+                if "exists" in value:
+                    ex = bool(value["exists"])
+                    clauses.append(expr.is_not(None) if ex else expr.is_(None))
+
+                if "in" in value:
+                    clauses.append(expr.in_(list(value["in"] or [])))
+                if "notin" in value:
+                    clauses.append(expr.notin_(list(value["notin"] or [])))
+                if "gt" in value:
+                    clauses.append(expr > value["gt"])
+                if "gte" in value:
+                    clauses.append(expr >= value["gte"])
+                if "lt" in value:
+                    clauses.append(expr < value["lt"])
+                if "lte" in value:
+                    clauses.append(expr <= value["lte"])
+
+                if not clauses:
+                    raise ValueError(f"Unsupported filter dict for {expr}: {value}")
+                return clauses
+
+            if isinstance(value, (list, tuple, set)):
+                return [expr.in_(list(value))]
+
+            return [_cmp(expr, value)]
+
+        # -------------------------
+        # Build WHERE (instances)
+        # -------------------------
+        where_clauses = [InstanceRow.dataset_id == ds.dataset_id]
+        for name, value in filters.items():
+            expr = _inst_col(name)
+            where_clauses.extend(_compile_filter(expr, value))
+
+        # -------------------------
+        # Classify include columns by preferred owner table
+        # (prefer higher-level tables to avoid ambiguity)
+        # -------------------------
+        patient_cols = set(PatientRow.__table__.columns.keys())
+        study_cols = set(StudyRow.__table__.columns.keys())
+        series_cols = set(SeriesRow.__table__.columns.keys())
+        inst_colnames = set(inst_cols.keys())
+
+        def _preferred_owner(col: str) -> str:
+            if col in patient_cols:
+                return "patient"
+            if col in study_cols:
+                return "study"
+            if col in series_cols:
+                return "series"
+            if col in inst_colnames:
+                return "instance"
+            raise KeyError(
+                f"include column {col!r} not found on PatientRow/StudyRow/SeriesRow/InstanceRow."
+            )
+
+        include_patient: list[str] = []
+        include_study: list[str] = []
+        include_series: list[str] = []
+        include_instance: list[str] = []
+
+        for c in include:
+            owner = _preferred_owner(c)
+
+            # SPECIAL: SERIES-level "Modality" should come from SeriesRow if it exists.
+            if lvl == "SERIES" and c == "Modality" and c in series_cols:
+                owner = "series"
+
+            if owner == "patient":
+                include_patient.append(c)
+            elif owner == "study":
+                include_study.append(c)
+            elif owner == "series":
+                include_series.append(c)
+            else:
+                include_instance.append(c)
+
+        # Disallow including instance-level non-ID columns at higher levels (ambiguous)
+        if lvl != "INSTANCE":
+            bad_inst = [c for c in include_instance if c not in level_cols]
+            msg = (
+                f"At query_level={lvl}, include columns {bad_inst} are instance-level columns. "
+                "This is ambiguous because values can vary within a patient/study/series group. "
+                "Include them only at query_level='INSTANCE' or include higher-level fields "
+                "(PatientName/StudyDescription/SeriesDescription/Modality from SeriesRow, etc.)."
+            )
+            if bad_inst:
+                raise ValueError(msg)
+
+        # -------------------------
+        # Build statement
+        # -------------------------
+        ids_exprs = [inst_cols[c].label(c) for c in level_cols]
+
+        if lvl == "INSTANCE":
+            # select IDs + any extra instance includes (excluding duplicate ID cols)
+            extra_inst = [c for c in include_instance if c not in level_cols]
+            select_exprs = ids_exprs + [inst_cols[c].label(c) for c in extra_inst]
+            stmt: Select = select(*select_exprs).where(and_(*where_clauses))
+
+        else:
+            # DISTINCT IDs from instances
+            ids_stmt: Select = select(*ids_exprs).where(and_(*where_clauses)).distinct()
+            ids_sq = ids_stmt.subquery("ids")
+
+            # base select from ids
+            select_exprs = [ids_sq.c[c].label(c) for c in level_cols]
+            stmt = select(*select_exprs).select_from(ids_sq)
+
+            # Join patient columns (if requested)
+            if include_patient:
+                stmt = stmt.join(
+                    PatientRow,
+                    and_(
+                        PatientRow.dataset_id == ds.dataset_id,
+                        PatientRow.PatientID == ids_sq.c.PatientID,
+                    ),
+                    isouter=True,
+                )
+                for c in include_patient:
+                    stmt = stmt.add_columns(getattr(PatientRow, c).label(c))
+
+            # Join study columns (if requested)
+            if include_study:
+                if "StudyInstanceUID" not in level_cols:
+                    raise ValueError(
+                        f"Cannot include study columns {include_study} at level {lvl}."
+                    )
+                stmt = stmt.join(
+                    StudyRow,
+                    and_(
+                        StudyRow.dataset_id == ds.dataset_id,
+                        StudyRow.StudyInstanceUID == ids_sq.c.StudyInstanceUID,
+                    ),
+                    isouter=True,
+                )
+                for c in include_study:
+                    stmt = stmt.add_columns(getattr(StudyRow, c).label(c))
+
+            # Join series columns (if requested)
+            if include_series:
+                if "SeriesInstanceUID" not in level_cols:
+                    raise ValueError(
+                        f"Cannot include series columns {include_series} at level {lvl}."
+                    )
+                stmt = stmt.join(
+                    SeriesRow,
+                    and_(
+                        SeriesRow.dataset_id == ds.dataset_id,
+                        SeriesRow.SeriesInstanceUID == ids_sq.c.SeriesInstanceUID,
+                    ),
+                    isouter=True,
+                )
+                for c in include_series:
+                    stmt = stmt.add_columns(getattr(SeriesRow, c).label(c))
+
+        # -------------------------
+        # ORDER BY / LIMIT
+        # -------------------------
+        sort_keys = list(sort_by) if sort_by else list(level_cols)
+
+        # Only keep sort columns that exist in the final selected columns
+        final_cols = list(stmt.selected_columns.keys())
+        sort_keys = [c for c in sort_keys if c in final_cols]
+
+        if sort_keys:
+            order_exprs = [stmt.selected_columns[c] for c in sort_keys]
+            stmt = stmt.order_by(*order_exprs)
+
+        if limit is not None:
+            stmt = stmt.limit(int(limit))
+
+        # -------------------------
+        # Execute
+        # -------------------------
+        with ds._session() as s:
+            rows = s.execute(stmt).all()
+
+        colnames = list(stmt.selected_columns.keys())
+        return pd.DataFrame(rows, columns=colnames)
+
     def get_modality_distribution(
         self,
         *,
@@ -349,3 +655,28 @@ class DICOMLoaderDB:
             logger_name=__name__,  # <— must be supported
             **kw,
         )
+
+    @classmethod
+    def list_datasets(cls, db_url: str) -> List[dict]:
+        """
+        Convenience wrapper for DatasetNodeDB.list_datasets(db_url).
+        """
+        return DatasetNodeDB.list_datasets(db_url)
+
+    @classmethod
+    def from_existing_dataset(
+        cls,
+        *,
+        db_url: str,
+        dataset_id: Optional[str] = None,
+        seq_policy: str = "json",
+    ) -> "DICOMLoaderDB":
+        """
+        Create a DICOMLoaderDB instance without ingesting a directory, by attaching
+        an existing DatasetNodeDB.
+        """
+        obj = cls(dicom_path=".")
+        obj.dataset = DatasetNodeDB.open_existing(
+            db_url, dataset_id=dataset_id, seq_policy=seq_policy
+        )
+        return obj
