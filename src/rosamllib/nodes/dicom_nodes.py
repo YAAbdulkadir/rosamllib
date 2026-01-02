@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Any, Union, Callable, Iterable
 import re
@@ -388,20 +389,55 @@ class DatasetNode:
             derive_frame_from_references=derive_frame_from_references,
         )
 
-    def get_modality_distribution(self):
-        modality_counts = {}
+    def get_modality_distribution(
+        self,
+        *,
+        all_instance_level: bool = False,
+        force_instance_level_modalities: Iterable[str] = (),
+        unknown_label: str = "Unknown",
+    ) -> dict[str, int]:
+        """
+        Compute modality distribution across the dataset.
+
+        Counting rules
+        --------------
+        - By default, each Series contributes +1 to its modality.
+        - If `all_instance_level=True`, every Instance contributes +1.
+        - If a modality is listed in `force_instance_level_modalities`,
+        it is counted at the Instance level regardless of the global setting.
+
+        Parameters
+        ----------
+        all_instance_level : bool, optional
+            If True, count all modalities at the instance level.
+        force_instance_level_modalities : Iterable[str], optional
+            Modalities that should always be counted at the instance level.
+        unknown_label : str, optional
+            Label used when Series.Modality is missing or empty.
+
+        Returns
+        -------
+        dict[str, int]
+            Mapping from modality name to count.
+        """
+        modality_counts = defaultdict(int)
+        force_set = set(force_instance_level_modalities)
 
         for patient_node in self:
             for study_node in patient_node:
                 for series_node in study_node:
-                    modality = series_node.Modality or "Unknown"
-                    if modality in ["RTPLAN", "RTDOSE", "RTSTRUCT", "RTRECORD"]:
-                        for instance_node in series_node:
-                            modality_counts[modality] = modality_counts.get(modality, 0) + 1
-                    else:
-                        modality_counts[modality] = modality_counts.get(modality, 0) + 1
+                    modality = series_node.Modality or unknown_label
 
-        return modality_counts
+                    use_instance_level = all_instance_level or modality in force_set
+
+                    if use_instance_level:
+                        # Count each instance
+                        for _ in series_node:
+                            modality_counts[modality] += 1
+                    else:
+                        # Count once per series
+                        modality_counts[modality] += 1
+        return dict(modality_counts)
 
     def report_sources_without_reach(
         self, **kwargs
@@ -892,7 +928,7 @@ class PatientNode(_ExtensibleAttrs):
         target_level: str = "SERIES",
         target_modality: Optional[Union[str, Iterable[str]]] = None,
         recursive: bool = True,
-        traversal: str = "references",  # <- if you prefer your exact spelling, use "referenced"
+        traversal: str = "references",
         include_start: bool = False,
         # Optional power-users: custom predicates (applied in addition to modality/level)
         start_predicate: Optional[Callable[[NodeT], bool]] = None,
@@ -912,7 +948,7 @@ class PatientNode(_ExtensibleAttrs):
             raise ValueError("start_level/target_level must be 'SERIES' or 'INSTANCE'")
 
         trav = traversal.lower()
-        # Match your accepted spellings; keep both for convenience
+        # keep both for convenience
         if trav == "references":
             trav = "referenced"
         if trav not in {"referenced", "referencing", "frame"}:
